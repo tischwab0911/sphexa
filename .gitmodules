@@ -1,3 +1,7 @@
 [submodule "extern/grackle/grackle_repo"]
 	path = extern/grackle/grackle_repo
 	url = https://github.com/grackle-project/grackle
+[submodule "domain"]
+	path = domain
+	url = git@github.com:tischwab0911/cornerstone-octree.git
+	branch = FMMexa
