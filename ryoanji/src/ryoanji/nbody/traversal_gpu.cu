@@ -563,10 +563,31 @@ double traverse(cstone::GroupView grp, const int initNodeIdx, const Tc* __restri
     numBlocks            = std::min(numBlocks, TravConfig::maxNumActiveBlocks);
 
     resetTraversalCounters<<<1, 1>>>();
+
+    cudaEvent_t evStart, evEnd;
+    cudaEventCreate(&evStart);
+    cudaEventCreate(&evEnd);
+    cudaEventRecord(evStart);
+
     if (numBlocks > 0)
     traverseKernel<<<numBlocks, TravConfig::numThreads>>>(grp, initNodeIdx, xt, yt, zt, mt, ht, xs, ys, zs, ms, hs,
                                                           childOffsets, internalToLeaf, layout, sourceCenter,
                                                           multipoles, G, numShells, boxL, p, ax, ay, az, gmPool);
+
+    cudaEventRecord(evEnd);
+    cudaDeviceSynchronize();
+
+    float msTraverse;
+    cudaEventElapsedTime(&msTraverse, evStart, evEnd);
+
+    auto stats = readBhStats();
+    printf("[Barnes-Hut GPU] Traversal: %.3f ms | blocks: %d\n", msTraverse, numBlocks);
+    printf("[Barnes-Hut GPU] sumP2P: %llu, maxP2P: %llu, sumM2P: %llu, maxM2P: %llu, maxStack: %llu\n",
+           stats[0], stats[1], stats[2], stats[3], stats[4]);
+
+    cudaEventDestroy(evStart);
+    cudaEventDestroy(evEnd);
+
     float totalPotential;
     checkGpuErrors(cudaMemcpyFromSymbol(&totalPotential, GPU_SYMBOL(totalPotentialGlob), sizeof(float)));
     return 0.5 * Tc(G) * totalPotential;

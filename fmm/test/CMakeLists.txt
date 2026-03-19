@@ -1,0 +1,62 @@
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/../ryoanji/cmake")
+include(setup_GTest)
+
+set(FMM_TEST_INCLUDE_DIRS
+    ${CSTONE_DIR} ${CSTONE_TEST_DIR}
+    ${PROJECT_SOURCE_DIR}/../ryoanji/src
+    ${PROJECT_SOURCE_DIR}/src)
+
+set(testname fmm_cpu_unit_tests)
+add_executable(${testname} spherical_bh_vs_direct.cpp spherical_fmm_vs_direct.cpp cartesian_fmm_vs_direct.cpp test_main.cpp)
+target_compile_options(${testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
+target_include_directories(${testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
+target_link_libraries(${testname} PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+add_test(NAME ${testname} COMMAND ${testname})
+
+if(CMAKE_CUDA_COMPILER OR CMAKE_HIP_COMPILER)
+    set(gpu_testname fmm_gpu_unit_tests)
+    add_executable(${gpu_testname}
+        spherical_fmm_gpu_vs_cpu.cu
+        spherical_kernels_gpu_vs_cpu.cu
+        cartesian_qpole_fmm_gpu_vs_bh.cu
+        test_main.cpp)
+    target_compile_options(${gpu_testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
+    target_include_directories(${gpu_testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
+    target_link_libraries(${gpu_testname} PRIVATE
+        cstone_gpu cstone_thrust_incl ryoanji_kernels
+        GTest::gtest_main OpenMP::OpenMP_CXX)
+    if(CMAKE_CUDA_COMPILER)
+        target_compile_options(${gpu_testname} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+        target_link_libraries(${gpu_testname} PRIVATE CUDA::cudart)
+    endif()
+    set_target_properties(${gpu_testname} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_test(NAME ${gpu_testname} COMMAND ${gpu_testname})
+
+    set(tune_testname fmm_tune_benchmark)
+    add_executable(${tune_testname} tune_fmm.cu test_main.cpp)
+    target_compile_options(${tune_testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
+    target_include_directories(${tune_testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
+    target_link_libraries(${tune_testname} PRIVATE
+        cstone_gpu cstone_thrust_incl
+        GTest::gtest_main OpenMP::OpenMP_CXX)
+    if(CMAKE_CUDA_COMPILER)
+        target_compile_options(${tune_testname} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+        target_link_libraries(${tune_testname} PRIVATE CUDA::cudart)
+    endif()
+    set_target_properties(${tune_testname} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_test(NAME ${tune_testname} COMMAND ${tune_testname})
+
+    set(cart_tune_testname fmm_cart_tune_benchmark)
+    add_executable(${cart_tune_testname} tune_cartesian_fmm.cu test_main.cpp)
+    target_compile_options(${cart_tune_testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
+    target_include_directories(${cart_tune_testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
+    target_link_libraries(${cart_tune_testname} PRIVATE
+        cstone_gpu cstone_thrust_incl
+        GTest::gtest_main OpenMP::OpenMP_CXX)
+    if(CMAKE_CUDA_COMPILER)
+        target_compile_options(${cart_tune_testname} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+        target_link_libraries(${cart_tune_testname} PRIVATE CUDA::cudart)
+    endif()
+    set_target_properties(${cart_tune_testname} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_test(NAME ${cart_tune_testname} COMMAND ${cart_tune_testname})
+endif()
