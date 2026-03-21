@@ -20,19 +20,19 @@
 
 #pragma once
 
-#include <atomic>
 #include <cmath>
 #include <vector>
 
 #include "cstone/util/array.hpp"
 #include "cstone/focus/source_center.hpp"
-#include "cstone/sfc/box.hpp"
 #include "cstone/traversal/traversal.hpp"
 #include "ryoanji/nbody/types.h"
 #include "ryoanji/nbody/kernel.hpp"
 
 namespace fmm
 {
+
+enum MacVariant : int { ScalarMac = 0, DirectionalMac = 1 };
 
 using ryoanji::Vec3;
 using ryoanji::Vec4;
@@ -370,19 +370,19 @@ void downsweepLocalExpansions(std::span<const TreeNodeIndex> levelRange, const T
 // Full FMM gravity computation via dual traversal
 // ---------------------------------------------------------------------------
 
-template<class T, class KeyType, class Th, class Tm>
+template<MacVariant macType = ScalarMac, class T, class KeyType, class Th, class Tm>
 void computeGravityFMM(const KeyType* prefixes, const TreeNodeIndex* childOffsets,
                         const TreeNodeIndex* internalToLeaf, std::span<const TreeNodeIndex> leafToInternalMap,
                         std::span<const TreeNodeIndex> levelRange, const cstone::SourceCenterType<T>* centers,
                         const CartesianMultipole<T>* multipoles, const LocalIndex* layout,
                         TreeNodeIndex firstLeafIndex, TreeNodeIndex lastLeafIndex, const T* x, const T* y,
-                        const T* z, const Th* h, const Tm* m, const cstone::Box<T>& box, float theta, float G,
-                        Th* ugrav, Th* ax, Th* ay, Th* az, T* ugravTot)
+                        const T* z, const Th* h, const Tm* m, const cstone::Box<T>& box, float G,
+                        float invTheta, Th* ugrav, Th* ax, Th* ay, Th* az, T* ugravTot)
 {
     TreeNodeIndex numNodes = levelRange.back();
-    T             invTheta = T(1) / T(theta);
 
-    // 1. Compute geometric node sizes for the dual-traversal MAC
+    // 0. Compute geometric centers/sizes from SFC prefixes
+    std::vector<Vec3<T>> geoCenters(numNodes);
     std::vector<Vec3<T>> geoSizes(numNodes);
     for (TreeNodeIndex i = 0; i < numNodes; ++i)
     {
@@ -391,10 +391,11 @@ void computeGravityFMM(const KeyType* prefixes, const TreeNodeIndex* childOffset
         unsigned level    = cstone::decodePrefixLength(prefix) / 3;
         auto     nodeBox  = cstone::sfcIBox(cstone::sfcKey(startKey), level);
         auto [center, sz] = cstone::centerAndSize<KeyType>(nodeBox, box);
-        geoSizes[i]       = sz;
+        geoCenters[i]     = center;
+        geoSizes[i]       = sz * T(invTheta);
     }
 
-    // 2. Allocate local expansions (zero-initialized)
+    // 1. Allocate local expansions (zero-initialized)
     std::vector<CartesianLocalExpansion<T>> locals(numNodes);
     for (auto& L : locals)
         for (auto& v : L)
@@ -408,32 +409,29 @@ void computeGravityFMM(const KeyType* prefixes, const TreeNodeIndex* childOffset
     std::vector<T> pax(numTargets, 0), pay(numTargets, 0), paz(numTargets, 0), ppot(numTargets, 0);
 
     // 4. Dual traversal: M2L for well-separated pairs, P2P for nearby leaf-leaf pairs
-    std::atomic<unsigned> cpuM2lCount{0}, cpuP2pCount{0};
-
-    auto continuation = [centers, &geoSizes, invTheta](TreeNodeIndex a, TreeNodeIndex b) -> bool
+    auto continuation = [centers, &geoCenters, &geoSizes](TreeNodeIndex a, TreeNodeIndex b) -> bool
     {
-        // Opening angle MAC: l/r < theta  =>  r² > (l/theta)²
-        Vec3<T> comA  = util::makeVec3(centers[a]);
-        Vec3<T> comB  = util::makeVec3(centers[b]);
-        T       dist2 = norm2(comA - comB);
-
-        T lA        = T(2) * std::max({geoSizes[a][0], geoSizes[a][1], geoSizes[a][2]});
-        T lB        = T(2) * std::max({geoSizes[b][0], geoSizes[b][1], geoSizes[b][2]});
-        T threshold = std::max(lA, lB) * invTheta;
-
-        return dist2 < threshold * threshold; // true = MAC fails, keep descending
+        if constexpr (macType == DirectionalMac)
+        {
+            return cstone::evaluateMacM2L(
+                util::makeVec3(centers[a]), centers[a][3],
+                util::makeVec3(centers[b]), centers[b][3]);
+        }
+        else
+        {
+            return cstone::evaluateMac(util::makeVec3(centers[a]), centers[a][3],
+                                        geoCenters[b], geoSizes[b]);
+        }
     };
 
-    auto m2lCallback = [&centers, &multipoles, &locals, &cpuM2lCount](TreeNodeIndex a, TreeNodeIndex b)
+    auto m2lCallback = [&centers, &multipoles, &locals](TreeNodeIndex a, TreeNodeIndex b)
     {
-        cpuM2lCount.fetch_add(1u, std::memory_order_relaxed);
         M2L(util::makeVec3(centers[a]), util::makeVec3(centers[b]), multipoles[b], locals[a]);
     };
 
-    auto p2pCallback = [internalToLeaf, layout, x, y, z, h, m, &pax, &pay, &paz, &ppot, firstTarget,
-                        &cpuP2pCount](TreeNodeIndex a, TreeNodeIndex b)
+    auto p2pCallback = [internalToLeaf, layout, x, y, z, h, m, &pax, &pay, &paz, &ppot,
+                        firstTarget](TreeNodeIndex a, TreeNodeIndex b)
     {
-        cpuP2pCount.fetch_add(1u, std::memory_order_relaxed);
         TreeNodeIndex aLeaf = internalToLeaf[a];
         TreeNodeIndex bLeaf = internalToLeaf[b];
 
@@ -473,8 +471,6 @@ void computeGravityFMM(const KeyType* prefixes, const TreeNodeIndex* childOffset
                                   p2pCallback);
         }
     }
-
-    printf("[CartesianFMM CPU] M2L calls: %u, P2P calls: %u\n", cpuM2lCount.load(), cpuP2pCount.load());
 
     // 5. L2L downsweep
     downsweepLocalExpansions<T>(levelRange, childOffsets, centers, locals.data());

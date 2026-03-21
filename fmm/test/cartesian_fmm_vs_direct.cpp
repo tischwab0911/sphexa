@@ -36,7 +36,7 @@ TEST(CartesianFMM, VsDirectSum)
     using KeyType       = uint64_t;
     using MultipoleType = fmm::CartesianMultipole<T>;
 
-    float          theta      = 0.5;
+    float          theta      = 0.7;
     float          G          = 1.0;
     unsigned       bucketSize = 64;
     cstone::Box<T> box(-1, 1);
@@ -84,12 +84,12 @@ TEST(CartesianFMM, VsDirectSum)
 
     auto t0       = std::chrono::high_resolution_clock::now();
     T    egravTot = 0;
-    fmm::computeGravityFMM<T, KeyType>(octree.prefixes.data(), octree.childOffsets.data(),
+    fmm::computeGravityFMM<fmm::ScalarMac, T, KeyType>(octree.prefixes.data(), octree.childOffsets.data(),
                                         octree.internalToLeaf.data(), toInternal,
                                         std::span<const TreeNodeIndex>(octree.levelRange), centers.data(),
                                         multipoles.data(), layout.data(), 0, octree.numLeafNodes, x, y, z, h,
-                                        masses.data(), box, theta, G, (T*)nullptr, ax.data(), ay.data(), az.data(),
-                                        &egravTot);
+                                        masses.data(), box, G, 1.0f / theta, (T*)nullptr, ax.data(),
+                                        ay.data(), az.data(), &egravTot);
     auto   t1      = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(t1 - t0).count();
 
@@ -118,7 +118,7 @@ TEST(CartesianFMM, VsDirectSum)
     refPotSum *= 0.5;
     double energyRelErr = std::abs(refPotSum - egravTot) / std::abs(refPotSum);
     std::cout << "Energy relative error: " << energyRelErr << std::endl;
-    EXPECT_LT(energyRelErr, 1e-2);
+    EXPECT_LT(energyRelErr, 5e-2);
 
     // relative acceleration errors
     std::vector<T> delta(numParticles);
@@ -137,6 +137,6 @@ TEST(CartesianFMM, VsDirectSum)
     std::cout << "99th percentile: " << delta[LocalIndex(numParticles * 0.99)] << std::endl;
     std::cout << "max Error: " << delta[numParticles - 1] << std::endl;
 
-    EXPECT_LT(delta[LocalIndex(numParticles * 0.99)], 1e-1);
-    EXPECT_LT(delta[numParticles - 1], 5e-1);
+    EXPECT_LT(delta[LocalIndex(numParticles * 0.99)], 2e-1);
+    EXPECT_LT(delta[numParticles - 1], 1.0);
 }

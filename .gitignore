@@ -45,3 +45,6 @@ test/constants.txt
 *.exe
 *.out
 *.app
+
+# Ignore agent instructions
+CLAUDE.md

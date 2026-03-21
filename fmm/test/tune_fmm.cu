@@ -66,7 +66,7 @@ namespace
 //  USER-EDITABLE TUNING RANGES
 // ════════════════════════════════════════════════════════════════════════════════
 
-//  numWarps values to benchmark (consumer warps per block = numWarps - kProducerWarpsPerBlock).
+//  numWarps values to benchmark (consumer warps per block = numWarps - producerWarpsPerBlock).
 using TuneWarpList = std::integer_sequence<int, 6, 7, 8>;
 
 //  blocksPerCluster — fixed for all configurations:
@@ -283,7 +283,8 @@ using FmmTuneTravConfig = TraversalConfig<tuneConfigs[I].stackCap,
                                           tuneConfigs[I].travChunkSize,
                                           tuneConfigs[I].travForcePush,
                                           tuneConfigs[I].travAttemptPush,
-                                          tuneConfigs[I].travAttemptPop>;
+                                          tuneConfigs[I].travAttemptPop,
+                                          1>;
 
 // ── FMM dual traversal kernel with TravConfig as template parameter ──────────
 

@@ -693,7 +693,7 @@ __global__ void l2pKernel(TreeNodeIndex firstLeaf, TreeNodeIndex lastLeaf, const
 // Dual traversal kernel
 // ---------------------------------------------------------------------------
 
-using FmmTravConfig = cstone::TraversalConfig<1024, 224, 704, 512, 160, 96, 192, 640, 224, 32>;
+using FmmTravConfig = cstone::TraversalConfig<1024, 224, 704, 512, 160, 96, 192, 640, 224, 32, 1>;
 
 struct FmmDualConfig
 {

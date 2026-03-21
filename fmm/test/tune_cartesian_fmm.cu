@@ -69,7 +69,7 @@ namespace
 
 //  numWarps values to benchmark (wider sweep than spherical — cheap M2L may
 //  benefit from fewer consumer warps).
-using TuneWarpList = std::integer_sequence<int, 4, 5, 6, 7, 8>;
+using TuneWarpList = std::integer_sequence<int, 3, 4, 5, 6>;
 
 //  blocksPerCluster — fixed for all configurations:
 static constexpr unsigned kBpc = 8;
@@ -106,7 +106,7 @@ struct TuneConfigBuilder
     size_t count = 0;
 };
 
-constexpr size_t kMaxTuneConfigs = 50;
+constexpr size_t kMaxTuneConfigs = 80;
 
 struct BuiltTuneConfigs
 {
@@ -156,19 +156,21 @@ consteval void pushUnique(TuneConfigBuilder<MaxConfigs>& b, const TuneParams& p)
     if (b.count < MaxConfigs) { b.values[b.count++] = p; }
 }
 
-// ~40 configs: 4 interaction seeds x 10 traversal variants
+// ~72 configs: 6 interaction seeds x 12 traversal variants
 consteval BuiltTuneConfigs buildCartTuneConfigs()
 {
     TuneConfigBuilder<kMaxTuneConfigs> b{};
 
     constexpr unsigned sc = 1024;
 
-    // 4 interaction seeds (one smaller, one with smaller chunkSize, production, one larger)
-    constexpr std::array<TuneParams, 4> interactionSeeds{
-        TuneParams{sc, 128, 512, 352, 96,  64, 0, 0, 0, 0},  // small
-        TuneParams{sc, 160, 608, 416, 128, 96, 0, 0, 0, 0},  // smaller
-        TuneParams{sc, 224, 704, 512, 160, 96, 0, 0, 0, 0},  // production
-        TuneParams{sc, 256, 768, 576, 192, 96, 0, 0, 0, 0}   // larger
+    // 6 interaction seeds (from top-25 tuning results + exploration)
+    constexpr std::array<TuneParams, 6> interactionSeeds{
+        TuneParams{sc, 128, 512, 352,  96,  64, 0, 0, 0, 0},  // small (appeared in top 25)
+        TuneParams{sc, 160, 608, 416, 128,  96, 0, 0, 0, 0},  // medium (appeared in top 25)
+        TuneParams{sc, 224, 704, 512, 160,  96, 0, 0, 0, 0},  // old production
+        TuneParams{sc, 256, 768, 576, 192,  96, 0, 0, 0, 0},  // best from tuning (new production)
+        TuneParams{sc, 288, 832, 640, 224, 128, 0, 0, 0, 0},  // larger (exploration)
+        TuneParams{sc, 320, 896, 704, 256, 128, 0, 0, 0, 0},  // even larger (exploration)
     };
 
     struct TravVariant
@@ -179,18 +181,20 @@ consteval BuiltTuneConfigs buildCartTuneConfigs()
         unsigned attemptPop;
     };
 
-    // 10 traversal variants bracketing production {192, 640, 224, 32}
-    constexpr std::array<TravVariant, 10> traversalVariants{{
-        {192, 576, 192, 16},
-        {192, 640, 224, 32},  // production
+    // 12 traversal variants — winners cluster around tFP=576-768, tAP=224-256, tAPo=16-32
+    constexpr std::array<TravVariant, 12> traversalVariants{{
+        {160, 576, 192, 16},
+        {160, 640, 224, 32},
+        {192, 512, 224, 16},   // tighter forcePush
+        {192, 576, 224, 16},
+        {192, 576, 224, 32},   // production
+        {192, 640, 224, 16},
+        {192, 640, 224, 32},
+        {192, 640, 256, 48},
         {192, 704, 256, 32},
         {192, 768, 224, 16},
-        {192, 640, 256, 48},
-        {192, 576, 224, 32},
         {192, 768, 256, 32},
-        {192, 896, 224, 16},
         {256, 768, 320, 64},
-        {160, 640, 224, 32}
     }};
 
     for (const auto& iSeed : interactionSeeds)
@@ -216,7 +220,7 @@ consteval BuiltTuneConfigs buildCartTuneConfigs()
 static constexpr BuiltTuneConfigs builtTuneConfigs = buildCartTuneConfigs();
 static constexpr auto& tuneConfigs                 = builtTuneConfigs.values;
 static constexpr size_t numTuneConfigs             = builtTuneConfigs.count;
-static_assert(numTuneConfigs <= 50, "Per-warp configuration budget exceeded (max 50)");
+static_assert(numTuneConfigs <= 80, "Per-warp configuration budget exceeded (max 80)");
 static_assert(numTuneConfigs * TuneWarpList::size() <= 300,
               "Configured sweep exceeds 300 total benchmarks");
 
@@ -286,13 +290,15 @@ using FmmTuneTravConfig = TraversalConfig<tuneConfigs[I].stackCap,
                                           tuneConfigs[I].travChunkSize,
                                           tuneConfigs[I].travForcePush,
                                           tuneConfigs[I].travAttemptPush,
-                                          tuneConfigs[I].travAttemptPop>;
+                                          tuneConfigs[I].travAttemptPop,
+                                          1>;
 
 // ── FMM dual traversal kernel with TravConfig as template parameter ──────────
 
 template<int numWarps, class TravConfig, class T>
 __global__ void tuneFmmDualTraversalKernel(
     const TreeNodeIndex* __restrict__ childOffsets,
+    const ryoanji::Vec3<T>* __restrict__ geoCenters,
     const ryoanji::Vec3<T>* __restrict__ geoSizes,
     const ryoanji::Vec4<T>* __restrict__ centers,
     const fmm::CartesianMultipole<T>* __restrict__ multipoles,
@@ -309,7 +315,6 @@ __global__ void tuneFmmDualTraversalKernel(
     T* __restrict__ pay,
     T* __restrict__ paz,
     ryoanji::LocalIndex firstTarget,
-    T invTheta,
     GlobalWorkQueue gq,
     GlobalTraversalQueue tq,
     unsigned* nProd,
@@ -320,21 +325,11 @@ __global__ void tuneFmmDualTraversalKernel(
     using ryoanji::Vec4;
     using ryoanji::LocalIndex;
 
-    // Opening angle MAC: l/r < theta  =>  r² > (l/theta)²
-    auto continuation = [geoSizes, centers, invTheta] __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
+    // DirectionalMac: symmetric max-radius check on expansion centers
+    auto continuation = [centers] __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
     {
-        Vec3<T> comA = util::makeVec3(centers[a]);
-        Vec3<T> comB = util::makeVec3(centers[b]);
-        T       dist2 = norm2(comA - comB);
-
-        Vec3<T> sizeA = geoSizes[a];
-        Vec3<T> sizeB = geoSizes[b];
-
-        T lA        = T(2) * max(max(sizeA[0], sizeA[1]), sizeA[2]);
-        T lB        = T(2) * max(max(sizeB[0], sizeB[1]), sizeB[2]);
-        T threshold = max(lA, lB) * invTheta;
-
-        return dist2 < threshold * threshold;
+        return cstone::evaluateMacM2L(util::makeVec3(centers[a]), centers[a][3],
+                                       util::makeVec3(centers[b]), centers[b][3]);
     };
 
     auto m2l = [centers, multipoles, locals, d_m2lCount] __device__(TreeNodeIndex a, TreeNodeIndex b)
@@ -382,6 +377,7 @@ FmmTuneResult benchOneFmm(
     const TuneParams& params,
     // Tree arrays on device
     TreeNodeIndex* d_childOffsets,
+    ryoanji::Vec3<T>* d_geoCenters,
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
@@ -398,7 +394,6 @@ FmmTuneResult benchOneFmm(
     TreeNodeIndex numNodes,
     TreeNodeIndex firstLeafIndex,
     TreeNodeIndex lastLeafIndex,
-    T invTheta,
     std::span<const TreeNodeIndex> levelRange,
     // CPU reference
     unsigned refM2l, unsigned refP2p, double refEnergy,
@@ -491,9 +486,9 @@ FmmTuneResult benchOneFmm(
     auto launchKernel = [&]()
     {
         cudaLaunchKernelEx(&cfg, tuneFmmDualTraversalKernel<numWarps, TravConfig, T>,
-                           d_childOffsets, d_geoSizes, d_centers, d_multipoles, d_locals,
+                           d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
                            d_internalToLeaf, d_layout, d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
-                           firstTarget, invTheta, gq, tq, d_nP, d_m2lCount, d_p2pCount);
+                           firstTarget, gq, tq, d_nP, d_m2lCount, d_p2pCount);
     };
 
     // Reset-then-launch lambda for kernel-only timing
@@ -626,6 +621,7 @@ template<int NW, size_t CI, class T>
 void benchAndRecord(
     std::vector<FmmTuneResult>& out,
     TreeNodeIndex* d_childOffsets,
+    ryoanji::Vec3<T>* d_geoCenters,
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
@@ -640,7 +636,6 @@ void benchAndRecord(
     TreeNodeIndex numNodes,
     TreeNodeIndex firstLeafIndex,
     TreeNodeIndex lastLeafIndex,
-    T invTheta,
     std::span<const TreeNodeIndex> levelRange,
     unsigned refM2l, unsigned refP2p, double refEnergy,
     const T* refMasses, float G,
@@ -655,11 +650,11 @@ void benchAndRecord(
 
     auto r = benchOneFmm<NW, FmmTuneTravConfig<CI>, T>(
         c,
-        d_childOffsets, d_geoSizes, d_centers, d_multipoles, d_locals,
+        d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
         d_internalToLeaf, d_leafToInternal, d_layout,
         d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
         firstTarget, numTargets, numNodes, firstLeafIndex, lastLeafIndex,
-        invTheta, levelRange,
+        levelRange,
         refM2l, refP2p, refEnergy, refMasses, G,
         nWarm, nRuns);
 
@@ -679,6 +674,7 @@ void benchAllConfigs(
     std::index_sequence<CIs...>,
     std::vector<FmmTuneResult>& out,
     TreeNodeIndex* d_childOffsets,
+    ryoanji::Vec3<T>* d_geoCenters,
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
@@ -693,7 +689,6 @@ void benchAllConfigs(
     TreeNodeIndex numNodes,
     TreeNodeIndex firstLeafIndex,
     TreeNodeIndex lastLeafIndex,
-    T invTheta,
     std::span<const TreeNodeIndex> levelRange,
     unsigned refM2l, unsigned refP2p, double refEnergy,
     const T* refMasses, float G,
@@ -701,11 +696,11 @@ void benchAllConfigs(
 {
     (benchAndRecord<NW, CIs, T>(
          out,
-         d_childOffsets, d_geoSizes, d_centers, d_multipoles, d_locals,
+         d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
          d_internalToLeaf, d_leafToInternal, d_layout,
          d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
          firstTarget, numTargets, numNodes, firstLeafIndex, lastLeafIndex,
-         invTheta, levelRange,
+         levelRange,
          refM2l, refP2p, refEnergy, refMasses, G,
          nWarm, nRuns),
      ...);
@@ -718,6 +713,7 @@ void dispatchWarps(
     std::integer_sequence<int, First, Rest...>,
     std::vector<FmmTuneResult>& out,
     TreeNodeIndex* d_childOffsets,
+    ryoanji::Vec3<T>* d_geoCenters,
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
@@ -732,7 +728,6 @@ void dispatchWarps(
     TreeNodeIndex numNodes,
     TreeNodeIndex firstLeafIndex,
     TreeNodeIndex lastLeafIndex,
-    T invTheta,
     std::span<const TreeNodeIndex> levelRange,
     unsigned refM2l, unsigned refP2p, double refEnergy,
     const T* refMasses, float G,
@@ -742,11 +737,11 @@ void dispatchWarps(
     benchAllConfigs<First, T>(
         std::make_index_sequence<numTuneConfigs>{},
         out,
-        d_childOffsets, d_geoSizes, d_centers, d_multipoles, d_locals,
+        d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
         d_internalToLeaf, d_leafToInternal, d_layout,
         d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
         firstTarget, numTargets, numNodes, firstLeafIndex, lastLeafIndex,
-        invTheta, levelRange,
+        levelRange,
         refM2l, refP2p, refEnergy, refMasses, G,
         nWarm, nRuns);
 
@@ -755,11 +750,11 @@ void dispatchWarps(
         dispatchWarps<T>(
             std::integer_sequence<int, Rest...>{},
             out,
-            d_childOffsets, d_geoSizes, d_centers, d_multipoles, d_locals,
+            d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
             d_internalToLeaf, d_leafToInternal, d_layout,
             d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
             firstTarget, numTargets, numNodes, firstLeafIndex, lastLeafIndex,
-            invTheta, levelRange,
+            levelRange,
             refM2l, refP2p, refEnergy, refMasses, G,
             nWarm, nRuns);
     }
@@ -776,9 +771,8 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     using KeyType       = uint64_t;
     using MultipoleType = fmm::CartesianMultipole<T>;
 
-    float          theta = 0.5;
+    float          theta = 0.7;
     float          G     = 1.0;
-    T              invTheta = T(1) / T(theta);
     cstone::Box<T> box(-1, 1);
 
     // ── Open result file ──
@@ -868,11 +862,11 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     T cpuEgrav = 0;
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    fmm::computeGravityFMM<T, KeyType>(
+    fmm::computeGravityFMM<fmm::DirectionalMac, T, KeyType>(
         octree.prefixes.data(), octree.childOffsets.data(), octree.internalToLeaf.data(), toInternal,
         std::span<const TreeNodeIndex>(octree.levelRange), centers.data(), multipoles.data(), layout.data(),
-        firstLeafIdx, lastLeafIdx, x, y, z, h, masses.data(), box, theta, G, (T*)nullptr, cpuAx.data(),
-        cpuAy.data(), cpuAz.data(), &cpuEgrav);
+        firstLeafIdx, lastLeafIdx, x, y, z, h, masses.data(), box, G, 1.0f / theta, (T*)nullptr,
+        cpuAx.data(), cpuAy.data(), cpuAz.data(), &cpuEgrav);
     auto   t1         = std::chrono::high_resolution_clock::now();
     double cpuElapsed = std::chrono::duration<double>(t1 - t0).count();
     printf("  CPU Cartesian FMM (quadrupole): %.3f s, energy=%.10e\n", cpuElapsed, cpuEgrav);
@@ -880,28 +874,10 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     // Re-run the CPU dual traversal with counting-only callbacks to get reference counts.
     std::atomic<unsigned> cpuM2lRef{0}, cpuP2pRef{0};
     {
-        // Compute geometric sizes for MAC
-        std::vector<Vec3<T>> geoSizes(numNodes);
-        for (TreeNodeIndex i = 0; i < numNodes; ++i)
+        auto continuation = [&centers](TreeNodeIndex a, TreeNodeIndex b) -> bool
         {
-            KeyType  prefix   = octree.prefixes[i];
-            KeyType  startKey = cstone::decodePlaceholderBit(prefix);
-            unsigned level    = cstone::decodePrefixLength(prefix) / 3;
-            auto     nodeBox  = cstone::sfcIBox(cstone::sfcKey(startKey), level);
-            auto [center, sz] = cstone::centerAndSize<KeyType>(nodeBox, box);
-            geoSizes[i]       = sz;
-        }
-
-        // Opening angle MAC: l/r < theta  =>  r² > (l/theta)²
-        auto continuation = [&centers, &geoSizes, invTheta](TreeNodeIndex a, TreeNodeIndex b) -> bool
-        {
-            Vec3<T> comA  = util::makeVec3(centers[a]);
-            Vec3<T> comB  = util::makeVec3(centers[b]);
-            T       dist2 = norm2(comA - comB);
-            T lA          = T(2) * std::max({geoSizes[a][0], geoSizes[a][1], geoSizes[a][2]});
-            T lB          = T(2) * std::max({geoSizes[b][0], geoSizes[b][1], geoSizes[b][2]});
-            T threshold   = std::max(lA, lB) * invTheta;
-            return dist2 < threshold * threshold;
+            return cstone::evaluateMacM2L(util::makeVec3(centers[a]), centers[a][3],
+                                           util::makeVec3(centers[b]), centers[b][3]);
         };
         auto m2lCount = [&cpuM2lRef](TreeNodeIndex, TreeNodeIndex) { cpuM2lRef.fetch_add(1u, std::memory_order_relaxed); };
         auto p2pCount = [&cpuP2pRef](TreeNodeIndex, TreeNodeIndex) { cpuP2pRef.fetch_add(1u, std::memory_order_relaxed); };
@@ -930,10 +906,9 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     //  Phase 3: GPU setup (done once)
     // ════════════════════════════════════════════════════════════════════════
 
-    printf("\nUploading to GPU...\n");
-
-    // Compute geometric sizes
-    std::vector<Vec3<T>> h_geoSizes(numNodes);
+    // Compute geometric centers/sizes for GPU kernel (still passed as parameters)
+    std::vector<ryoanji::Vec3<T>> refGeoCenters(numNodes);
+    std::vector<ryoanji::Vec3<T>> refGeoSizes(numNodes);
     for (TreeNodeIndex i = 0; i < numNodes; ++i)
     {
         KeyType  prefix   = octree.prefixes[i];
@@ -941,25 +916,33 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
         unsigned level    = cstone::decodePrefixLength(prefix) / 3;
         auto     nodeBox  = cstone::sfcIBox(cstone::sfcKey(startKey), level);
         auto [center, sz] = cstone::centerAndSize<KeyType>(nodeBox, box);
-        h_geoSizes[i]     = sz;
+        refGeoCenters[i]  = center;
+        refGeoSizes[i]    = sz;
     }
 
+    printf("\nUploading to GPU...\n");
+
     // Upload tree structure
-    Vec3<T>*       d_geoSizes;
+    ryoanji::Vec3<T>* d_geoCenters;
+    ryoanji::Vec3<T>* d_geoSizes;
     TreeNodeIndex* d_childOffsets;
     TreeNodeIndex* d_internalToLeaf;
     TreeNodeIndex* d_leafToInternal;
     LocalIndex*    d_layout;
     Vec4<T>*       d_centers;
 
-    checkGpuErrors(cudaMalloc(&d_geoSizes, numNodes * sizeof(Vec3<T>)));
+    checkGpuErrors(cudaMalloc(&d_geoCenters, numNodes * sizeof(ryoanji::Vec3<T>)));
+    checkGpuErrors(cudaMalloc(&d_geoSizes, numNodes * sizeof(ryoanji::Vec3<T>)));
     checkGpuErrors(cudaMalloc(&d_childOffsets, (numNodes + 1) * sizeof(TreeNodeIndex)));
     checkGpuErrors(cudaMalloc(&d_internalToLeaf, numNodes * sizeof(TreeNodeIndex)));
     checkGpuErrors(cudaMalloc(&d_leafToInternal, numLeaves * sizeof(TreeNodeIndex)));
     checkGpuErrors(cudaMalloc(&d_layout, (numLeaves + 1) * sizeof(LocalIndex)));
     checkGpuErrors(cudaMalloc(&d_centers, numNodes * sizeof(Vec4<T>)));
 
-    checkGpuErrors(cudaMemcpy(d_geoSizes, h_geoSizes.data(), numNodes * sizeof(Vec3<T>), cudaMemcpyHostToDevice));
+    checkGpuErrors(cudaMemcpy(d_geoCenters, refGeoCenters.data(), numNodes * sizeof(ryoanji::Vec3<T>),
+                              cudaMemcpyHostToDevice));
+    checkGpuErrors(cudaMemcpy(d_geoSizes, refGeoSizes.data(), numNodes * sizeof(ryoanji::Vec3<T>),
+                              cudaMemcpyHostToDevice));
     checkGpuErrors(cudaMemcpy(d_childOffsets, octree.childOffsets.data(), (numNodes + 1) * sizeof(TreeNodeIndex),
                               cudaMemcpyHostToDevice));
     checkGpuErrors(cudaMemcpy(d_internalToLeaf, octree.internalToLeaf.data(), numNodes * sizeof(TreeNodeIndex),
@@ -1016,11 +999,11 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     printf("\nRunning benchmarks...\n");
     dispatchWarps<T>(
         TuneWarpList{}, results,
-        d_childOffsets, d_geoSizes, d_centers, d_multipoles, d_locals,
+        d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
         d_internalToLeaf, d_leafToInternal, d_layout,
         d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
         firstTarget, numTargets, numNodes, firstLeafIdx, lastLeafIdx,
-        invTheta, std::span<const TreeNodeIndex>(octree.levelRange),
+        std::span<const TreeNodeIndex>(octree.levelRange),
         refM2l, refP2p, double(cpuEgrav), masses.data(), G,
         numWarmup, numRuns);
 
@@ -1028,15 +1011,15 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     //  Phase 5: Report
     // ════════════════════════════════════════════════════════════════════════
 
-    // Find production baseline (nW=7, production CartTravConfig params)
+    // Find production baseline (nW=4, production CartTravConfig params)
     float baselineMedian = 0.f;
     for (const auto& r : results)
     {
-        if (r.valid && r.numWarps == 7 &&
-            r.params.chunkSize == 224 && r.params.forcePush == 704 &&
-            r.params.attemptPush == 512 && r.params.attemptPop == 160 &&
+        if (r.valid && r.numWarps == 4 &&
+            r.params.chunkSize == 256 && r.params.forcePush == 768 &&
+            r.params.attemptPush == 576 && r.params.attemptPop == 192 &&
             r.params.forcePop == 96 &&
-            r.params.travChunkSize == 192 && r.params.travForcePush == 640 &&
+            r.params.travChunkSize == 192 && r.params.travForcePush == 576 &&
             r.params.travAttemptPush == 224 && r.params.travAttemptPop == 32)
         {
             baselineMedian = r.stats.median;
@@ -1063,7 +1046,7 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     printDual(resultFile, "  particles=%u  leaves=%d  nodes=%d  bucket=%u  (Cartesian quadrupole)\n",
               numParticles, numLeaves, numNodes, bucketSize);
     printDual(resultFile, "  CPU ref: M2L=%u  P2P=%u  energy=%.10e\n", refM2l, refP2p, cpuEgrav);
-    printDual(resultFile, "  baseline (nW=7 prod): %.3f ms\n\n", baselineMedian);
+    printDual(resultFile, "  baseline (nW=4 prod): %.3f ms\n\n", baselineMedian);
 
     printDual(resultFile,
               "  nW | iCS  iFP  iAP iAPo iFPo | tCS  tFP  tAP tAPo |"
@@ -1175,6 +1158,7 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     if (resultFile) std::fclose(resultFile);
 
     // ── Cleanup ──
+    cudaFree(d_geoCenters);
     cudaFree(d_geoSizes);
     cudaFree(d_childOffsets);
     cudaFree(d_internalToLeaf);

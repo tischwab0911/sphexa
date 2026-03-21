@@ -59,4 +59,17 @@ if(CMAKE_CUDA_COMPILER OR CMAKE_HIP_COMPILER)
     endif()
     set_target_properties(${cart_tune_testname} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     add_test(NAME ${cart_tune_testname} COMMAND ${cart_tune_testname})
+
+    set(scaling_testname fmm_scaling_benchmark)
+    add_executable(${scaling_testname} scaling_fmm_vs_bh.cu test_main.cpp)
+    target_compile_options(${scaling_testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
+    target_include_directories(${scaling_testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
+    target_link_libraries(${scaling_testname} PRIVATE
+        cstone_gpu cstone_thrust_incl ryoanji_kernels
+        GTest::gtest_main OpenMP::OpenMP_CXX)
+    if(CMAKE_CUDA_COMPILER)
+        target_compile_options(${scaling_testname} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+        target_link_libraries(${scaling_testname} PRIVATE CUDA::cudart)
+    endif()
+    set_target_properties(${scaling_testname} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
