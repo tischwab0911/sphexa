@@ -1122,4 +1122,277 @@ void computeGravityFMMGpu(
     cudaFree(d_tsegR);
 }
 
+// ---------------------------------------------------------------------------
+// Distributed overload — accepts pre-computed multipoles from MultipoleHolder::upsweep()
+// ---------------------------------------------------------------------------
+
+/*! @brief Run FMM dual traversal using multipoles computed by a distributed upsweep
+ *
+ * @param d_prefixes         SFC node keys on GPU (from octreeViewAcc().prefixes)
+ * @param d_childOffsets     child offset array on GPU
+ * @param d_internalToLeaf   internal-to-leaf map on GPU
+ * @param d_leafToInternal   leaf-to-internal map on GPU (leaf portion only)
+ * @param d_layout           particle offsets per leaf cell on GPU
+ * @param d_centers          expansion centers on GPU (from expansionCentersAcc())
+ * @param d_multipoles       pre-computed multipoles on GPU (from MultipoleHolder::upsweep())
+ * @param levelRange         CPU-side level range span (from octreeViewAcc().levelRangeSpan())
+ * @param numNodes           total number of octree nodes
+ * @param numLeaves          number of leaf nodes
+ * @param numParticlesWithHalos  total particles including halos
+ * @param firstOwnedParticle    start of owned particle range
+ * @param lastOwnedParticle     end of owned particle range
+ * @param d_x,d_y,d_z,d_h,d_m  particle data on GPU
+ * @param box                   coordinate bounding box
+ * @param G                     gravitational constant
+ * @param invTheta              1/theta for MAC
+ * @param d_ax,d_ay,d_az        output accelerations on GPU (G-scaled, owned range only)
+ * @param ugravTot              output potential sum (owned particles only)
+ * @param stats                 optional timing stats (msUpsweep will be 0)
+ */
+template<MacVariant macType = ScalarMac, class T, class KeyType>
+void computeGravityFMMGpuDistributed(
+    const KeyType* d_prefixes,
+    const TreeNodeIndex* d_childOffsets,
+    const TreeNodeIndex* d_internalToLeaf,
+    const TreeNodeIndex* d_leafToInternal,
+    const LocalIndex* d_layout,
+    const cstone::SourceCenterType<T>* d_centers,
+    const CartesianMultipole<T>* d_multipoles,
+    std::span<const TreeNodeIndex> levelRange,
+    TreeNodeIndex numNodes, TreeNodeIndex numLeaves,
+    LocalIndex numParticlesWithHalos,
+    LocalIndex firstOwnedParticle, LocalIndex lastOwnedParticle,
+    const T* d_x, const T* d_y, const T* d_z, const T* d_h, const T* d_m,
+    const cstone::Box<T>& box, float G, float invTheta,
+    T* d_ax, T* d_ay, T* d_az,
+    T* ugravTot,
+    FmmGpuStats* stats = nullptr)
+{
+    using Tacc = float;
+
+    LocalIndex firstTarget = 0;
+    LocalIndex numTargets  = numParticlesWithHalos;
+
+    // 1. Compute geometric centers/sizes on GPU from SFC prefixes
+    Vec3<T>* d_geoCenters;
+    Vec3<T>* d_geoSizes;
+    checkGpuErrors(cudaMalloc(&d_geoCenters, numNodes * sizeof(Vec3<T>)));
+    checkGpuErrors(cudaMalloc(&d_geoSizes, numNodes * sizeof(Vec3<T>)));
+    cstone::computeGeoCentersGpu(d_prefixes, numNodes, d_geoCenters, d_geoSizes, box);
+
+    // Scale geo sizes by invTheta for scalar MAC
+    if constexpr (macType == ScalarMac)
+    {
+        int nt = 256;
+        int nb = cstone::iceil(numNodes, nt);
+        if (nb) { scaleVec3Kernel<<<nb, nt>>>(d_geoSizes, numNodes, T(invTheta)); }
+    }
+
+    // 2. Create CUDA events for phase timing
+    cudaEvent_t evTravStart, evTravEnd;
+    cudaEvent_t evL2LStart, evL2LEnd, evL2PStart, evL2PEnd;
+    checkGpuErrors(cudaEventCreate(&evTravStart));
+    checkGpuErrors(cudaEventCreate(&evTravEnd));
+    checkGpuErrors(cudaEventCreate(&evL2LStart));
+    checkGpuErrors(cudaEventCreate(&evL2LEnd));
+    checkGpuErrors(cudaEventCreate(&evL2PStart));
+    checkGpuErrors(cudaEventCreate(&evL2PEnd));
+
+    // 3. Allocate + zero-init device locals and particle accumulators
+    CartesianLocalExpansion<Tacc>* d_locals;
+    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(CartesianLocalExpansion<Tacc>)));
+    checkGpuErrors(cudaMemset(d_locals, 0, numNodes * sizeof(CartesianLocalExpansion<Tacc>)));
+
+    Tacc *d_ppot, *d_pax, *d_pay, *d_paz;
+    checkGpuErrors(cudaMalloc(&d_ppot, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMalloc(&d_pax, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMalloc(&d_pay, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMalloc(&d_paz, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_ppot, 0, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_pax, 0, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_pay, 0, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_paz, 0, numTargets * sizeof(Tacc)));
+
+    // 4. Allocate global work queues for dual traversal
+    constexpr unsigned gChunk = CartTravConfig::chunkSize;
+    constexpr unsigned gSegs  = 2048;
+    constexpr unsigned gCap   = gSegs * gChunk;
+
+    TreeNodeIndex* d_gA;
+    TreeNodeIndex* d_gB;
+    int*           d_gIsP2P;
+    unsigned*      d_wHead;
+    unsigned*      d_rHead;
+    unsigned*      d_segCount;
+    unsigned*      d_segR;
+    unsigned*      d_nProd;
+
+    checkGpuErrors(cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_gIsP2P, gCap * sizeof(int)));
+    checkGpuErrors(cudaMalloc(&d_wHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_rHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_segCount, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_segR, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_nProd, sizeof(unsigned)));
+
+    cstone::GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
+
+    constexpr unsigned tChunk = CartTravConfig::travChunkSize;
+    constexpr unsigned tSegs  = 2048;
+    constexpr unsigned tCap   = tSegs * tChunk;
+
+    TreeNodeIndex* d_tA;
+    TreeNodeIndex* d_tB;
+    unsigned*      d_twHead;
+    unsigned*      d_trHead;
+    unsigned*      d_tsegR;
+
+    checkGpuErrors(cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_tB, tCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_twHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_trHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned)));
+
+    cstone::GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
+
+    // 5. Reset queues
+    checkGpuErrors(cudaMemset(d_wHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_rHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_segR, 0, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_twHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_trHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned)));
+
+    // 6. Configure cluster launch
+    constexpr unsigned kBlocksPerCluster = CartDualConfig::kBlocksPerCluster;
+    constexpr unsigned numWarps          = CartDualConfig::numWarps;
+    constexpr unsigned threadsPerBlock   = CartDualConfig::numThreadsPerBlock;
+
+    unsigned totalBlocks = kBlocksPerCluster * 64u;
+
+    cudaLaunchConfig_t    dualCfg{};
+    dualCfg.gridDim  = {totalBlocks, 1, 1};
+    dualCfg.blockDim = {threadsPerBlock, 1, 1};
+    cudaLaunchAttribute dualAttr{};
+    dualAttr.id               = cudaLaunchAttributeClusterDimension;
+    dualAttr.val.clusterDim.x = kBlocksPerCluster;
+    dualAttr.val.clusterDim.y = 1;
+    dualAttr.val.clusterDim.z = 1;
+    dualCfg.attrs    = &dualAttr;
+    dualCfg.numAttrs = 1;
+
+    checkGpuErrors(cudaMemset(d_nProd, 0, sizeof(unsigned)));
+
+    // 7. Launch dual traversal
+    checkGpuErrors(cudaEventRecord(evTravStart));
+
+    checkGpuErrors(cudaLaunchKernelEx(&dualCfg, cartFmmDualTraversalKernel<macType, numWarps, T, Tacc>,
+                                      d_childOffsets,
+                                      d_geoCenters, d_geoSizes,
+                                      d_centers, d_multipoles, d_locals, d_internalToLeaf, d_layout, d_x,
+                                      d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz, firstTarget,
+                                      gq, tq, d_nProd));
+
+    checkGpuErrors(cudaEventRecord(evTravEnd));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 8. L2L downsweep
+    checkGpuErrors(cudaEventRecord(evL2LStart));
+    downsweepLocalExpansionsGpu(levelRange, d_childOffsets, d_centers, d_locals);
+    checkGpuErrors(cudaEventRecord(evL2LEnd));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 9. L2P — all leaves
+    checkGpuErrors(cudaEventRecord(evL2PStart));
+    {
+        constexpr int numThreadsL2P = 256;
+        if (numLeaves > 0)
+        {
+            l2pKernel<<<(numLeaves + numThreadsL2P - 1) / numThreadsL2P, numThreadsL2P>>>(
+                0, numLeaves, d_leafToInternal, d_layout, d_centers, d_locals, d_x, d_y, d_z, d_ppot,
+                d_pax, d_pay, d_paz, firstTarget);
+        }
+    }
+    checkGpuErrors(cudaEventRecord(evL2PEnd));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 10. Timing
+    float msTrav, msL2L, msL2P;
+    checkGpuErrors(cudaEventElapsedTime(&msTrav, evTravStart, evTravEnd));
+    checkGpuErrors(cudaEventElapsedTime(&msL2L, evL2LStart, evL2LEnd));
+    checkGpuErrors(cudaEventElapsedTime(&msL2P, evL2PStart, evL2PEnd));
+
+    if (stats) { *stats = {0.0f, msTrav, msL2L, msL2P}; }
+
+    checkGpuErrors(cudaEventDestroy(evTravStart));
+    checkGpuErrors(cudaEventDestroy(evTravEnd));
+    checkGpuErrors(cudaEventDestroy(evL2LStart));
+    checkGpuErrors(cudaEventDestroy(evL2LEnd));
+    checkGpuErrors(cudaEventDestroy(evL2PStart));
+    checkGpuErrors(cudaEventDestroy(evL2PEnd));
+
+    // 11. Apply G-scaling on owned range only
+    {
+        LocalIndex numOwned = lastOwnedParticle - firstOwnedParticle;
+        int        nt       = 256;
+        int        nb       = cstone::iceil(numOwned, nt);
+        if (nb)
+        {
+            applyGScalingKernel<<<nb, nt>>>(numOwned, G,
+                                            d_pax + firstOwnedParticle,
+                                            d_pay + firstOwnedParticle,
+                                            d_paz + firstOwnedParticle,
+                                            d_ax + firstOwnedParticle,
+                                            d_ay + firstOwnedParticle,
+                                            d_az + firstOwnedParticle);
+        }
+    }
+
+    // 12. Potential sum for owned particles only
+    if (ugravTot)
+    {
+        LocalIndex    numOwned = lastOwnedParticle - firstOwnedParticle;
+        std::vector<Tacc> h_ppot(numOwned);
+        std::vector<T>    h_m(numOwned);
+        checkGpuErrors(cudaMemcpy(h_ppot.data(), d_ppot + firstOwnedParticle, numOwned * sizeof(Tacc),
+                                  cudaMemcpyDeviceToHost));
+        checkGpuErrors(cudaMemcpy(h_m.data(), d_m + firstOwnedParticle, numOwned * sizeof(T),
+                                  cudaMemcpyDeviceToHost));
+        T ugravLoc = 0;
+        for (LocalIndex i = 0; i < numOwned; ++i)
+            ugravLoc += G * h_m[i] * h_ppot[i];
+        *ugravTot += T(0.5) * ugravLoc;
+    }
+
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 13. Free internally-allocated temporaries
+    cudaFree(d_geoCenters);
+    cudaFree(d_geoSizes);
+
+    cudaFree(d_locals);
+
+    cudaFree(d_ppot);
+    cudaFree(d_pax);
+    cudaFree(d_pay);
+    cudaFree(d_paz);
+
+    cudaFree(d_gA);
+    cudaFree(d_gB);
+    cudaFree(d_gIsP2P);
+    cudaFree(d_wHead);
+    cudaFree(d_rHead);
+    cudaFree(d_segCount);
+    cudaFree(d_segR);
+    cudaFree(d_nProd);
+
+    cudaFree(d_tA);
+    cudaFree(d_tB);
+    cudaFree(d_twHead);
+    cudaFree(d_trHead);
+    cudaFree(d_tsegR);
+}
+
 } // namespace fmm

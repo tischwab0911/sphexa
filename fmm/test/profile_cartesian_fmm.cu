@@ -42,7 +42,7 @@ TEST(CartesianFMM, ProfileDualTraversal)
     using KeyType = uint64_t;
     using Mpole   = fmm::CartesianMultipole<T>;
 
-    unsigned            N          = 2000000;
+    unsigned            N          = 100000000;
     float               theta      = 0.5f;
     float               G          = 1.0f;
     unsigned            bucketSize = 64;
