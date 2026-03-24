@@ -12,11 +12,15 @@
  *
  * @author Timo Schwab <tischwab@ethz.ch>
  *
- * Measures GPU traversal time for FMM (DirectionalMac)
- * and Barnes-Hut across a range of particle counts to find the crossover point
- * where FMM's O(N) scaling overtakes BH's O(N log N).
+ * Measures GPU traversal time for FMM (DirectionalMac) and Barnes-Hut across
+ * a range of particle counts to find the crossover point where FMM's O(N)
+ * scaling overtakes BH's O(N log N).
  *
- * At small N (<=100k), also runs a direct sum for accuracy validation.
+ * Uses GPU octree build (TreeBuilder) and GPU-native FMM overloads to keep
+ * all data on device. Only particle generation and p99 computation touch the CPU.
+ *
+ * Uses p99 relative acceleration error (vs direct sum at small N, vs spherical
+ * FMM at large N) instead of energy error for accuracy validation.
  */
 
 #include <algorithm>
@@ -31,107 +35,166 @@
 
 #include "cstone/cuda/cuda_utils.cuh"
 #include "cstone/cuda/thrust_util.cuh"
+#include "cstone/focus/source_center_gpu.h"
 #include "cstone/sfc/box.hpp"
 #include "cstone/tree/octree.hpp"
 #include "cstone/traversal/groups_gpu.h"
 #include "coord_samples/random.hpp"
 
+#include "ryoanji/interface/treebuilder.cuh"
 #include "ryoanji/nbody/cartesian_qpole.hpp"
+#include "ryoanji/nbody/direct.cuh"
 #include "ryoanji/nbody/kernel.hpp"
-#include "ryoanji/nbody/traversal_cpu.hpp"
 #include "ryoanji/nbody/traversal_gpu.h"
-#include "ryoanji/nbody/upsweep_cpu.hpp"
+#include "ryoanji/nbody/upsweep_gpu.h"
 
 #include "fmm/cartesian_qpole_fmm.cuh"
+#include "fmm/spherical_multipole.cuh"
 
 using namespace cstone;
 
-struct ScalingResult
+namespace
+{
+
+struct BenchmarkResult
 {
     unsigned N;
-    float    fmmDir;     // GPU traversal ms (total FMM phases)
-    float    bhMs;       // GPU BH traversal ms
+    float    fmmMedian, fmmMean, fmmStdev;
+    float    fmmUpsweepMed, fmmTraversalMed, fmmL2LMed, fmmL2PMed;
+    float    bhMedian, bhMean, bhStdev;
+    bool     hasAccuracy;
+    double   fmmP99Err, bhP99Err;
+    double   sphP99Err;
 };
 
-static ScalingResult runScalingPoint(unsigned N, float theta, unsigned bucketSize, const cstone::Box<double>& box,
-                                     float G)
+static float benchMedian(std::vector<float>& v)
+{
+    std::sort(v.begin(), v.end());
+    size_t n = v.size();
+    return (n % 2) ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
+}
+
+static float benchMean(const std::vector<float>& v)
+{
+    return std::accumulate(v.begin(), v.end(), 0.0f) / float(v.size());
+}
+
+static float benchStdev(const std::vector<float>& v, float m)
+{
+    float sumSq = 0;
+    for (float x : v)
+        sumSq += (x - m) * (x - m);
+    return std::sqrt(sumSq / float(v.size() - 1));
+}
+
+template<class T>
+static double computeP99(LocalIndex numParticles, const T* ax, const T* ay, const T* az, const T* refAx,
+                         const T* refAy, const T* refAz)
+{
+    std::vector<T> delta(numParticles);
+    for (LocalIndex i = 0; i < numParticles; ++i)
+    {
+        ryoanji::Vec3<T> aApprox{ax[i], ay[i], az[i]};
+        ryoanji::Vec3<T> aRef{refAx[i], refAy[i], refAz[i]};
+        T                refNorm = norm2(aRef);
+        delta[i]                 = refNorm > 0 ? std::sqrt(norm2(aApprox - aRef) / refNorm) : 0;
+    }
+    std::sort(delta.begin(), delta.end());
+    return double(delta[LocalIndex(numParticles * 0.99)]);
+}
+
+static BenchmarkResult runBenchmarkPoint(unsigned N, float theta, unsigned bucketSize, const cstone::Box<double>& box,
+                                         float G, int nWarmup, int nRuns)
 {
     using T       = double;
     using KeyType = uint64_t;
-    using FmmMpole = fmm::CartesianMultipole<T>;
-    using BhMpole  = ryoanji::CartesianQuadrupole<T>;
+    using BhMpole = ryoanji::CartesianQuadrupole<T>;
 
     LocalIndex numParticles = N;
+    float      invTheta     = 1.0f / theta;
 
+    // ===== Particle generation (CPU → GPU, one-time upload) =====
     RandomGaussianCoordinates<T, SfcKind<KeyType>> coordinates(numParticles, box);
-    coordinates.adjustH(2, 5);
 
-    const T* x = coordinates.x().data();
-    const T* y = coordinates.y().data();
-    const T* z = coordinates.z().data();
-    const T* h = coordinates.h().data();
+    thrust::device_vector<T> d_x(coordinates.x().begin(), coordinates.x().end());
+    thrust::device_vector<T> d_y(coordinates.y().begin(), coordinates.y().end());
+    thrust::device_vector<T> d_z(coordinates.z().begin(), coordinates.z().end());
+    thrust::device_vector<T> d_m(numParticles, T(1) / numParticles);
+    thrust::device_vector<T> d_h(numParticles, T(0.01));
 
-    std::vector<T> masses(numParticles, T(1) / numParticles);
+    // ===== GPU octree build =====
+    ryoanji::TreeBuilder<KeyType> treeBuilder(bucketSize);
+    int numSources = treeBuilder.update(rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), numParticles, box);
+    // x,y,z now SFC-sorted on device
 
-    // Build octree
-    auto [treeLeaves, counts] = computeOctree(std::span(coordinates.particleKeys()), bucketSize);
+    unsigned              highestLevel = treeBuilder.maxTreeLevel();
+    const TreeNodeIndex*  levelRange   = treeBuilder.levelRange();
+    TreeNodeIndex         numLeaves    = treeBuilder.numLeafNodes();
+    std::span<const TreeNodeIndex> levelRangeSpan(levelRange, highestLevel + 2);
 
-    OctreeData<KeyType, CpuTag> octree;
-    octree.resize(nNodes(treeLeaves));
-    updateInternalTree<KeyType>(treeLeaves, octree.data());
+    // ===== GPU source centers + MAC =====
+    thrust::device_vector<SourceCenterType<T>> d_centers(numSources);
+    cstone::computeLeafSourceCenterGpu(rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m),
+                                       treeBuilder.leafToInternal(), numLeaves,
+                                       treeBuilder.layout(), rawPtr(d_centers));
+    cstone::upsweepCentersGpu(highestLevel, levelRange,
+                              treeBuilder.childOffsets(), rawPtr(d_centers));
+    cstone::setMacGpu(treeBuilder.nodeKeys(), TreeNodeIndex(numSources), rawPtr(d_centers), invTheta, box);
 
-    std::vector<LocalIndex> layout(octree.numLeafNodes + 1, 0);
-    std::inclusive_scan(counts.begin(), counts.end(), layout.begin() + 1);
-
-    auto toInternal = leafToInternal(octree);
-
-    // Compute centers of mass + MAC
-    std::vector<SourceCenterType<T>> centers(octree.numNodes);
-    computeLeafMassCenter<T, T, T>(coordinates.x(), coordinates.y(), coordinates.z(), masses, toInternal, layout.data(),
-                                   centers.data());
-    upsweep(octree.levelRange, octree.childOffsets.data(), centers.data(), CombineSourceCenter<T>{});
-    setMac<T, KeyType>(octree.prefixes, centers, 1.0 / theta, box);
-
-    // Compute FMM multipoles
-    std::vector<FmmMpole> fmmMultipoles(octree.numNodes);
-    ryoanji::computeLeafMultipoles(x, y, z, masses.data(), toInternal, layout.data(), centers.data(),
-                                   fmmMultipoles.data());
-    ryoanji::upsweepMultipoles(octree.levelRange, octree.childOffsets.data(), centers.data(), fmmMultipoles.data());
-
-    float invTheta = 1.0f / theta;
-
-    // --- Run FMM with DirectionalMac ---
-    auto runFmm = [&](auto macTag) -> fmm::FmmGpuStats
+    // ===== FMM benchmark: warmup + timed runs =====
+    struct FmmRunResult
     {
-        std::vector<T> ax(numParticles, 0), ay(numParticles, 0), az(numParticles, 0);
-        T              egrav = 0;
         fmm::FmmGpuStats stats;
-
-        fmm::computeGravityFMMGpu<decltype(macTag)::value>(
-            octree.prefixes.data(), octree.childOffsets.data(), octree.internalToLeaf.data(), toInternal,
-            std::span<const TreeNodeIndex>(octree.levelRange), centers.data(), fmmMultipoles.data(), layout.data(), 0,
-            octree.numLeafNodes, x, y, z, h, masses.data(), box, G, invTheta, (T*)nullptr, ax.data(), ay.data(),
-            az.data(), &egrav, numParticles, &stats);
-
-        return stats;
+        T                egrav;
     };
 
-    auto dirStats = runFmm(std::integral_constant<fmm::MacVariant, fmm::DirectionalMac>{});
+    thrust::device_vector<T> d_fmmAx(numParticles), d_fmmAy(numParticles), d_fmmAz(numParticles);
 
-    // --- Run GPU Barnes-Hut with CUDA event timing ---
-    std::vector<BhMpole> bhMultipoles(octree.numNodes);
-    ryoanji::computeLeafMultipoles(x, y, z, masses.data(), toInternal, layout.data(), centers.data(),
-                                   bhMultipoles.data());
-    ryoanji::upsweepMultipoles(octree.levelRange, octree.childOffsets.data(), centers.data(), bhMultipoles.data());
+    auto runFmmOnce = [&]() -> FmmRunResult
+    {
+        checkGpuErrors(cudaMemset(rawPtr(d_fmmAx), 0, numParticles * sizeof(T)));
+        checkGpuErrors(cudaMemset(rawPtr(d_fmmAy), 0, numParticles * sizeof(T)));
+        checkGpuErrors(cudaMemset(rawPtr(d_fmmAz), 0, numParticles * sizeof(T)));
+        T                egrav = 0;
+        fmm::FmmGpuStats stats;
 
-    thrust::device_vector<T>                   d_x(x, x + numParticles), d_y(y, y + numParticles),
-                                               d_z(z, z + numParticles), d_h(h, h + numParticles);
-    thrust::device_vector<T>                   d_m(masses);
-    thrust::device_vector<TreeNodeIndex>       d_childOffsets(octree.childOffsets);
-    thrust::device_vector<TreeNodeIndex>       d_internalToLeaf(octree.internalToLeaf);
-    thrust::device_vector<LocalIndex>          d_layout(layout);
-    thrust::device_vector<SourceCenterType<T>> d_centers(centers);
-    thrust::device_vector<BhMpole>             d_bhMultipoles(bhMultipoles);
+        fmm::computeGravityFMMGpu<fmm::DirectionalMac>(
+            treeBuilder.nodeKeys(), treeBuilder.childOffsets(),
+            treeBuilder.internalToLeaf(), treeBuilder.leafToInternal(),
+            treeBuilder.layout(), rawPtr(d_centers),
+            levelRangeSpan, TreeNodeIndex(numSources), numLeaves,
+            rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_h), rawPtr(d_m),
+            box, G, invTheta, rawPtr(d_fmmAx), rawPtr(d_fmmAy), rawPtr(d_fmmAz),
+            &egrav, numParticles, &stats);
+
+        return {stats, egrav};
+    };
+
+    for (int i = 0; i < nWarmup; ++i)
+        runFmmOnce();
+
+    std::vector<float> fmmTotals, fmmUpsweeps, fmmTraversals, fmmL2Ls, fmmL2Ps;
+    for (int i = 0; i < nRuns; ++i)
+    {
+        auto [stats, egrav] = runFmmOnce();
+        fmmTotals.push_back(stats.msTotal());
+        fmmUpsweeps.push_back(stats.msUpsweep);
+        fmmTraversals.push_back(stats.msTraversal);
+        fmmL2Ls.push_back(stats.msL2L);
+        fmmL2Ps.push_back(stats.msL2P);
+    }
+
+    // Extra FMM run to capture accelerations for p99 (only when accuracy is computed)
+    if (N <= 5000000) { runFmmOnce(); }
+
+    // ===== BH benchmark =====
+    // BH multipoles — allocated on device, recomputed each timed run
+    thrust::device_vector<BhMpole> d_bhMultipoles(numSources);
+
+    // Read root childOffset from device (single scalar download)
+    TreeNodeIndex rootChildOffset;
+    checkGpuErrors(
+        cudaMemcpy(&rootChildOffset, treeBuilder.childOffsets(), sizeof(TreeNodeIndex), cudaMemcpyDeviceToHost));
 
     thrust::device_vector<T> d_bhAx(numParticles, 0), d_bhAy(numParticles, 0), d_bhAz(numParticles, 0);
 
@@ -139,117 +202,285 @@ static ScalingResult runScalingPoint(unsigned N, float theta, unsigned bucketSiz
     cstone::computeFixedGroups(LocalIndex(0), numParticles, ryoanji::bhMaxTargetSize(), groups);
     thrust::device_vector<int> globalPool(ryoanji::stackSize(groups.numGroups));
 
-    // Warmup BH
-    ryoanji::traverse(
-        groups.view(), octree.childOffsets[0],
-        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
-        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
-        rawPtr(d_childOffsets), rawPtr(d_internalToLeaf), rawPtr(d_layout),
-        rawPtr(d_centers), rawPtr(d_bhMultipoles),
-        T(G), 0, ryoanji::Vec3<T>{box.lx(), box.ly(), box.lz()},
-        (T*)nullptr, rawPtr(d_bhAx), rawPtr(d_bhAy), rawPtr(d_bhAz),
-        thrust::raw_pointer_cast(globalPool.data()));
+    auto bhUpsweep = [&]()
+    {
+        thrust::fill(d_bhMultipoles.begin(), d_bhMultipoles.end(), BhMpole{});
 
-    // Reset BH output
-    thrust::fill(d_bhAx.begin(), d_bhAx.end(), T(0));
-    thrust::fill(d_bhAy.begin(), d_bhAy.end(), T(0));
-    thrust::fill(d_bhAz.begin(), d_bhAz.end(), T(0));
+        ryoanji::computeLeafMultipoles(rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m),
+                                       treeBuilder.leafToInternal(), numLeaves, treeBuilder.layout(),
+                                       rawPtr(d_centers), rawPtr(d_bhMultipoles));
 
-    // Timed BH run
+        for (int level = int(highestLevel) - 1; level >= 1; --level)
+        {
+            TreeNodeIndex first = levelRange[level];
+            TreeNodeIndex last  = levelRange[level + 1];
+            if (first < last)
+            {
+                ryoanji::upsweepMultipoles(first, last, treeBuilder.childOffsets(), rawPtr(d_centers),
+                                           rawPtr(d_bhMultipoles));
+            }
+        }
+    };
+
+    auto runBhOnce = [&]()
+    {
+        bhUpsweep();
+
+        thrust::fill(d_bhAx.begin(), d_bhAx.end(), T(0));
+        thrust::fill(d_bhAy.begin(), d_bhAy.end(), T(0));
+        thrust::fill(d_bhAz.begin(), d_bhAz.end(), T(0));
+
+        ryoanji::traverse(groups.view(), rootChildOffset,
+                          rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
+                          rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
+                          treeBuilder.childOffsets(), treeBuilder.internalToLeaf(), treeBuilder.layout(),
+                          rawPtr(d_centers), rawPtr(d_bhMultipoles), T(G), 0,
+                          ryoanji::Vec3<T>{box.lx(), box.ly(), box.lz()},
+                          (T*)nullptr, rawPtr(d_bhAx), rawPtr(d_bhAy), rawPtr(d_bhAz),
+                          thrust::raw_pointer_cast(globalPool.data()));
+    };
+
+    // BH warmup
+    for (int i = 0; i < nWarmup; ++i)
+        runBhOnce();
+
+    // BH timed runs
     cudaEvent_t bhStart, bhEnd;
     checkGpuErrors(cudaEventCreate(&bhStart));
     checkGpuErrors(cudaEventCreate(&bhEnd));
 
-    checkGpuErrors(cudaEventRecord(bhStart));
-    ryoanji::traverse(
-        groups.view(), octree.childOffsets[0],
-        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
-        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
-        rawPtr(d_childOffsets), rawPtr(d_internalToLeaf), rawPtr(d_layout),
-        rawPtr(d_centers), rawPtr(d_bhMultipoles),
-        T(G), 0, ryoanji::Vec3<T>{box.lx(), box.ly(), box.lz()},
-        (T*)nullptr, rawPtr(d_bhAx), rawPtr(d_bhAy), rawPtr(d_bhAz),
-        thrust::raw_pointer_cast(globalPool.data()));
-    checkGpuErrors(cudaEventRecord(bhEnd));
-    checkGpuErrors(cudaDeviceSynchronize());
+    std::vector<float> bhTimes;
+    for (int i = 0; i < nRuns; ++i)
+    {
+        thrust::fill(d_bhMultipoles.begin(), d_bhMultipoles.end(), BhMpole{});
 
-    float bhMs = 0;
-    checkGpuErrors(cudaEventElapsedTime(&bhMs, bhStart, bhEnd));
+        checkGpuErrors(cudaEventRecord(bhStart));
+
+        ryoanji::computeLeafMultipoles(rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m),
+                                       treeBuilder.leafToInternal(), numLeaves, treeBuilder.layout(),
+                                       rawPtr(d_centers), rawPtr(d_bhMultipoles));
+
+        for (int level = int(highestLevel) - 1; level >= 1; --level)
+        {
+            TreeNodeIndex first = levelRange[level];
+            TreeNodeIndex last  = levelRange[level + 1];
+            if (first < last)
+            {
+                ryoanji::upsweepMultipoles(first, last, treeBuilder.childOffsets(), rawPtr(d_centers),
+                                           rawPtr(d_bhMultipoles));
+            }
+        }
+
+        thrust::fill(d_bhAx.begin(), d_bhAx.end(), T(0));
+        thrust::fill(d_bhAy.begin(), d_bhAy.end(), T(0));
+        thrust::fill(d_bhAz.begin(), d_bhAz.end(), T(0));
+
+        ryoanji::traverse(groups.view(), rootChildOffset,
+                          rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
+                          rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
+                          treeBuilder.childOffsets(), treeBuilder.internalToLeaf(), treeBuilder.layout(),
+                          rawPtr(d_centers), rawPtr(d_bhMultipoles), T(G), 0,
+                          ryoanji::Vec3<T>{box.lx(), box.ly(), box.lz()},
+                          (T*)nullptr, rawPtr(d_bhAx), rawPtr(d_bhAy), rawPtr(d_bhAz),
+                          thrust::raw_pointer_cast(globalPool.data()));
+
+        checkGpuErrors(cudaEventRecord(bhEnd));
+        checkGpuErrors(cudaDeviceSynchronize());
+
+        float ms = 0;
+        checkGpuErrors(cudaEventElapsedTime(&ms, bhStart, bhEnd));
+        bhTimes.push_back(ms);
+    }
+
     checkGpuErrors(cudaEventDestroy(bhStart));
     checkGpuErrors(cudaEventDestroy(bhEnd));
 
-    // --- Accuracy validation at small N ---
-    if (N <= 100000)
+    // ===== Spherical FMM for reference (N <= 5M) =====
+    thrust::device_vector<T> d_sphAx, d_sphAy, d_sphAz;
+    if (N <= 5000000)
     {
-        // Direct sum reference
-        std::vector<T> refAx(numParticles, 0), refAy(numParticles, 0), refAz(numParticles, 0);
-        std::vector<T> refPot(numParticles, 0);
-        ryoanji::directSum(x, y, z, h, masses.data(), numParticles, G, {box.lx(), box.ly(), box.lz()}, 0,
-                           refAx.data(), refAy.data(), refAz.data(), refPot.data());
+        d_sphAx.resize(numParticles, 0);
+        d_sphAy.resize(numParticles, 0);
+        d_sphAz.resize(numParticles, 0);
+        T sphEnergy = 0;
 
-        // FMM DirectionalMac accuracy check
-        std::vector<T> fmmDirAx(numParticles, 0), fmmDirAy(numParticles, 0), fmmDirAz(numParticles, 0);
-        T              fmmDirEgrav = 0;
-        fmm::computeGravityFMMGpu<fmm::DirectionalMac>(
-            octree.prefixes.data(), octree.childOffsets.data(), octree.internalToLeaf.data(), toInternal,
-            std::span<const TreeNodeIndex>(octree.levelRange), centers.data(), fmmMultipoles.data(), layout.data(), 0,
-            octree.numLeafNodes, x, y, z, h, masses.data(), box, G, invTheta, (T*)nullptr, fmmDirAx.data(),
-            fmmDirAy.data(), fmmDirAz.data(), &fmmDirEgrav, numParticles);
+        fmm::computeGravityFMMGpu(
+            treeBuilder.nodeKeys(), treeBuilder.childOffsets(),
+            treeBuilder.internalToLeaf(), treeBuilder.leafToInternal(),
+            treeBuilder.layout(), rawPtr(d_centers),
+            levelRangeSpan, TreeNodeIndex(numSources), numLeaves,
+            rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_h), rawPtr(d_m),
+            box, theta, G, rawPtr(d_sphAx), rawPtr(d_sphAy), rawPtr(d_sphAz),
+            &sphEnergy, numParticles);
+    }
 
-        // BH accuracy check
+    // ===== Compute statistics =====
+    BenchmarkResult result{};
+    result.N = N;
+
+    float fmmM        = benchMean(fmmTotals);
+    result.fmmMedian   = benchMedian(fmmTotals);
+    result.fmmMean     = fmmM;
+    result.fmmStdev    = benchStdev(fmmTotals, fmmM);
+
+    result.fmmUpsweepMed   = benchMedian(fmmUpsweeps);
+    result.fmmTraversalMed = benchMedian(fmmTraversals);
+    result.fmmL2LMed       = benchMedian(fmmL2Ls);
+    result.fmmL2PMed       = benchMedian(fmmL2Ps);
+
+    float bhM         = benchMean(bhTimes);
+    result.bhMedian    = benchMedian(bhTimes);
+    result.bhMean      = bhM;
+    result.bhStdev     = benchStdev(bhTimes, bhM);
+
+    result.sphP99Err   = 0;
+    result.hasAccuracy = false;
+    result.fmmP99Err   = 0;
+    result.bhP99Err    = 0;
+
+    // ===== P99 acceleration error computation (only for N <= 5M) =====
+    if (N <= 5000000)
+    {
+        // Download FMM, BH, spherical accelerations to CPU
+        std::vector<T> fmmAx(numParticles), fmmAy(numParticles), fmmAz(numParticles);
+        thrust::copy(d_fmmAx.begin(), d_fmmAx.end(), fmmAx.begin());
+        thrust::copy(d_fmmAy.begin(), d_fmmAy.end(), fmmAy.begin());
+        thrust::copy(d_fmmAz.begin(), d_fmmAz.end(), fmmAz.begin());
+
         std::vector<T> bhAx(numParticles), bhAy(numParticles), bhAz(numParticles);
         thrust::copy(d_bhAx.begin(), d_bhAx.end(), bhAx.begin());
         thrust::copy(d_bhAy.begin(), d_bhAy.end(), bhAy.begin());
         thrust::copy(d_bhAz.begin(), d_bhAz.end(), bhAz.begin());
 
-        auto computeP99 = [&](const std::vector<T>& ax, const std::vector<T>& ay, const std::vector<T>& az,
-                               const char* label)
+        std::vector<T> sphAx(numParticles), sphAy(numParticles), sphAz(numParticles);
+        thrust::copy(d_sphAx.begin(), d_sphAx.end(), sphAx.begin());
+        thrust::copy(d_sphAy.begin(), d_sphAy.end(), sphAy.begin());
+        thrust::copy(d_sphAz.begin(), d_sphAz.end(), sphAz.begin());
+
+        if (N <= 100000)
         {
-            std::vector<T> delta(numParticles);
+            // Small N: GPU direct sum as reference
+            thrust::device_vector<T> d_refAx(numParticles, 0), d_refAy(numParticles, 0),
+                                     d_refAz(numParticles, 0), d_refPot(numParticles, 0);
+            ryoanji::directSum(size_t(0), size_t(numParticles), size_t(numParticles),
+                               ryoanji::Vec3<T>{box.lx(), box.ly(), box.lz()}, 0,
+                               rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), rawPtr(d_h),
+                               rawPtr(d_refPot), rawPtr(d_refAx), rawPtr(d_refAy), rawPtr(d_refAz));
+
+            // Download and apply G-scaling (GPU directSum doesn't include G)
+            std::vector<T> refAx(numParticles), refAy(numParticles), refAz(numParticles);
+            thrust::copy(d_refAx.begin(), d_refAx.end(), refAx.begin());
+            thrust::copy(d_refAy.begin(), d_refAy.end(), refAy.begin());
+            thrust::copy(d_refAz.begin(), d_refAz.end(), refAz.begin());
             for (LocalIndex i = 0; i < numParticles; ++i)
             {
-                ryoanji::Vec3<T> aApprox{ax[i], ay[i], az[i]};
-                ryoanji::Vec3<T> aRef{refAx[i], refAy[i], refAz[i]};
-                T refNorm = norm2(aRef);
-                delta[i]  = refNorm > 0 ? std::sqrt(norm2(aApprox - aRef) / refNorm) : 0;
+                refAx[i] *= G;
+                refAy[i] *= G;
+                refAz[i] *= G;
             }
-            std::sort(delta.begin(), delta.end());
-            T p99 = delta[LocalIndex(numParticles * 0.99)];
-            printf("  %s p99 error: %.6f\n", label, p99);
-        };
 
-        printf("  Accuracy at N=%u:\n", N);
-        computeP99(fmmDirAx, fmmDirAy, fmmDirAz, "FMM Dir");
-        computeP99(bhAx, bhAy, bhAz, "BH     ");
+            result.fmmP99Err = computeP99(numParticles, fmmAx.data(), fmmAy.data(), fmmAz.data(), refAx.data(),
+                                          refAy.data(), refAz.data());
+            result.bhP99Err  = computeP99(numParticles, bhAx.data(), bhAy.data(), bhAz.data(), refAx.data(),
+                                          refAy.data(), refAz.data());
+            result.sphP99Err = computeP99(numParticles, sphAx.data(), sphAy.data(), sphAz.data(), refAx.data(),
+                                          refAy.data(), refAz.data());
+            result.hasAccuracy = true;
+
+            EXPECT_LT(result.fmmP99Err, 1e-1) << "Cartesian FMM p99 error too large at N=" << N;
+            EXPECT_LT(result.bhP99Err, 1e-1) << "BH p99 error too large at N=" << N;
+            EXPECT_LT(result.sphP99Err, 1e-2) << "Spherical FMM p99 error too large at N=" << N;
+        }
+        else
+        {
+            // Medium N: spherical FMM as reference
+            result.fmmP99Err = computeP99(numParticles, fmmAx.data(), fmmAy.data(), fmmAz.data(), sphAx.data(),
+                                          sphAy.data(), sphAz.data());
+            result.bhP99Err  = computeP99(numParticles, bhAx.data(), bhAy.data(), bhAz.data(), sphAx.data(),
+                                          sphAy.data(), sphAz.data());
+            result.sphP99Err   = 0;
+            result.hasAccuracy = true;
+
+            EXPECT_LT(result.fmmP99Err, 1e-1) << "Cartesian FMM p99 error vs spherical too large at N=" << N;
+            EXPECT_LT(result.bhP99Err, 1e-1) << "BH p99 error vs spherical too large at N=" << N;
+        }
     }
+    // N > 5M: no accuracy computation, just timing
 
-    return {N, dirStats.msTotal(), bhMs};
+    return result;
 }
 
-TEST(CartesianQpoleFMM, ScalingBenchmark)
+} // namespace
+
+TEST(CartesianFMM, BenchmarkFMMvsBH)
 {
-    float          theta      = 0.5f;
-    float          G          = 1.0f;
-    unsigned       bucketSize = 64;
+    float               theta      = 0.5f;
+    float               G          = 1.0f;
+    unsigned            bucketSize = 64;
     cstone::Box<double> box(-1, 1);
 
-    std::vector<unsigned> sizes = {50000, 100000, 200000, 500000, 1000000, 2000000, 5000000};
-    std::vector<ScalingResult> results;
+    std::vector<unsigned> sizes = {50000,     100000,    200000,    500000,     1000000,   2000000,  5000000,
+                                   10000000,  20000000,  50000000,  100000000,  200000000, 400000000};
+    std::vector<BenchmarkResult> results;
 
     for (unsigned N : sizes)
     {
-        printf("\n--- Running N = %u ---\n", N);
-        auto result = runScalingPoint(N, theta, bucketSize, box, G);
-        results.push_back(result);
+        int nWarmup = (N <= 5000000) ? 5 : 3;
+        int nRuns   = (N <= 5000000) ? 25 : 10;
+        auto r = runBenchmarkPoint(N, theta, bucketSize, box, G, nWarmup, nRuns);
+        results.push_back(r);
+
+        // Print per-N result immediately
+        float speedup = (r.bhMedian > 0) ? r.bhMedian / r.fmmMedian : 0;
+        char  fmmP99Str[16] = "    --   ";
+        char  bhP99Str[16]  = "    --   ";
+        char  sphP99Str[16] = "    --   ";
+        if (r.hasAccuracy)
+        {
+            snprintf(fmmP99Str, sizeof(fmmP99Str), "%.2e", r.fmmP99Err);
+            snprintf(bhP99Str, sizeof(bhP99Str), "%.2e", r.bhP99Err);
+            if (r.N <= 100000) { snprintf(sphP99Str, sizeof(sphP99Str), "%.2e", r.sphP99Err); }
+            else { snprintf(sphP99Str, sizeof(sphP99Str), "  (ref)  "); }
+        }
+        printf("[N=%9u] FMM %6.2f ms  BH %6.2f ms  speedup %5.2fx  FMM-p99 %s  BH-p99 %s  Sph-p99 %s\n", r.N,
+               r.fmmMedian, r.bhMedian, speedup, fmmP99Str, bhP99Str, sphP99Str);
+        fflush(stdout);
     }
 
     // Print summary table
-    printf("\n=== FMM vs BH Scaling (theta=%.1f, bucket=%u) ===\n", theta, bucketSize);
-    printf("       N | FMM Dir  |    BH\n");
-    printf("---------|----------|--------\n");
+    printf("\n=== FMM vs BH Benchmark (theta=%.1f, bucket=%u, 5+25 runs N<=5M, 3+10 runs N>5M) ===\n", theta,
+           bucketSize);
+    printf("       N | FMM med  | FMM mean |  BH med  |  BH mean | FMM/BH  | FMM p99  |  BH p99  | Sph p99\n");
+    printf("---------|----------|----------|----------|----------|---------|----------|----------|---------\n");
+
     for (const auto& r : results)
     {
-        printf(" %7u | %6.2f ms | %5.2f ms\n", r.N, r.fmmDir, r.bhMs);
+        float speedup = (r.bhMedian > 0) ? r.bhMedian / r.fmmMedian : 0;
+
+        char fmmP99Str[16] = "    --   ";
+        char bhP99Str[16]  = "    --   ";
+        char sphP99Str[16] = "    --   ";
+
+        if (r.hasAccuracy)
+        {
+            snprintf(fmmP99Str, sizeof(fmmP99Str), "%.2e", r.fmmP99Err);
+            snprintf(bhP99Str, sizeof(bhP99Str), "%.2e", r.bhP99Err);
+            if (r.N <= 100000) { snprintf(sphP99Str, sizeof(sphP99Str), "%.2e", r.sphP99Err); }
+            else { snprintf(sphP99Str, sizeof(sphP99Str), "  (ref)  "); }
+        }
+
+        printf(" %7u | %5.2f ms | %5.2f ms | %5.2f ms | %5.2f ms | %5.2fx | %s | %s | %s\n", r.N, r.fmmMedian,
+               r.fmmMean, r.bhMedian, r.bhMean, speedup, fmmP99Str, bhP99Str, sphP99Str);
+    }
+
+    // FMM phase breakdown
+    printf("\nFMM phase breakdown (median, ms):\n");
+    printf("       N | upsweep  | traversal |   L2L    |   L2P\n");
+    printf("---------|----------|-----------|----------|--------\n");
+    for (const auto& r : results)
+    {
+        printf(" %7u | %5.2f ms | %6.2f ms | %5.2f ms | %5.2f ms\n", r.N, r.fmmUpsweepMed, r.fmmTraversalMed,
+               r.fmmL2LMed, r.fmmL2PMed);
     }
     printf("\n");
 }

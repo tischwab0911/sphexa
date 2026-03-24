@@ -52,11 +52,21 @@
 #include "coord_samples/random.hpp"
 #include "performance/timing.cuh"
 
+#include <thrust/device_vector.h>
+
+#include "cstone/cuda/thrust_util.cuh"
+#include "cstone/traversal/groups_gpu.h"
+
+#include "ryoanji/nbody/cartesian_qpole.hpp"
 #include "ryoanji/nbody/traversal_cpu.hpp"
+#include "ryoanji/nbody/traversal_gpu.h"
 #include "ryoanji/nbody/upsweep_cpu.hpp"
+#include "ryoanji/nbody/upsweep_gpu.h"
 
 #include "fmm/cartesian_qpole_fmm.hpp"
 #include "fmm/cartesian_qpole_fmm.cuh"
+#include "fmm/spherical_multipole.hpp"
+#include "fmm/spherical_multipole.cuh"
 
 using namespace cstone;
 
@@ -69,10 +79,8 @@ namespace
 
 //  numWarps values to benchmark (wider sweep than spherical — cheap M2L may
 //  benefit from fewer consumer warps).
-using TuneWarpList = std::integer_sequence<int, 3, 4, 5, 6>;
-
-//  blocksPerCluster — fixed for all configurations:
-static constexpr unsigned kBpc = 8;
+// using TuneWarpList = std::integer_sequence<int, 3, 4, 5, 6, 7>;
+using TuneWarpList = std::integer_sequence<int, 4, 5, 6, 7, 8>;
 
 //  TraversalConfig parameter set.
 struct TuneParams
@@ -221,8 +229,8 @@ static constexpr BuiltTuneConfigs builtTuneConfigs = buildCartTuneConfigs();
 static constexpr auto& tuneConfigs                 = builtTuneConfigs.values;
 static constexpr size_t numTuneConfigs             = builtTuneConfigs.count;
 static_assert(numTuneConfigs <= 80, "Per-warp configuration budget exceeded (max 80)");
-static_assert(numTuneConfigs * TuneWarpList::size() <= 300,
-              "Configured sweep exceeds 300 total benchmarks");
+static_assert(numTuneConfigs * TuneWarpList::size() <= 400,
+              "Configured sweep exceeds 400 total benchmarks");
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  END OF USER-EDITABLE SECTION
@@ -295,14 +303,14 @@ using FmmTuneTravConfig = TraversalConfig<tuneConfigs[I].stackCap,
 
 // ── FMM dual traversal kernel with TravConfig as template parameter ──────────
 
-template<int numWarps, class TravConfig, class T>
+template<bool EnableCounting, int numWarps, class TravConfig, class T>
 __global__ void tuneFmmDualTraversalKernel(
     const TreeNodeIndex* __restrict__ childOffsets,
     const ryoanji::Vec3<T>* __restrict__ geoCenters,
     const ryoanji::Vec3<T>* __restrict__ geoSizes,
     const ryoanji::Vec4<T>* __restrict__ centers,
     const fmm::CartesianMultipole<T>* __restrict__ multipoles,
-    fmm::CartesianLocalExpansion<T>* __restrict__ locals,
+    fmm::CartesianLocalExpansion<float>* __restrict__ locals,
     const TreeNodeIndex* __restrict__ internalToLeaf,
     const ryoanji::LocalIndex* __restrict__ layout,
     const T* __restrict__ x,
@@ -310,10 +318,10 @@ __global__ void tuneFmmDualTraversalKernel(
     const T* __restrict__ z,
     const T* __restrict__ h,
     const T* __restrict__ m,
-    T* __restrict__ ppot,
-    T* __restrict__ pax,
-    T* __restrict__ pay,
-    T* __restrict__ paz,
+    float* __restrict__ ppot,
+    float* __restrict__ pax,
+    float* __restrict__ pay,
+    float* __restrict__ paz,
     ryoanji::LocalIndex firstTarget,
     GlobalWorkQueue gq,
     GlobalTraversalQueue tq,
@@ -321,6 +329,7 @@ __global__ void tuneFmmDualTraversalKernel(
     unsigned* d_m2lCount,
     unsigned* d_p2pCount)
 {
+    using Tacc = float;
     using ryoanji::Vec3;
     using ryoanji::Vec4;
     using ryoanji::LocalIndex;
@@ -334,40 +343,116 @@ __global__ void tuneFmmDualTraversalKernel(
 
     auto m2l = [centers, multipoles, locals, d_m2lCount] __device__(TreeNodeIndex a, TreeNodeIndex b)
     {
-        atomicAdd(d_m2lCount, 1u);
+        if constexpr (EnableCounting) { atomicAdd(d_m2lCount, 1u); }
         fmm::M2LGpu(util::makeVec3(centers[a]), util::makeVec3(centers[b]), multipoles[b], &locals[a]);
     };
 
     auto p2p = [internalToLeaf, layout, x, y, z, h, m, ppot, pax, pay, paz, firstTarget,
-                d_p2pCount] __device__(TreeNodeIndex a, TreeNodeIndex b)
+                d_p2pCount] __device__(unsigned p2pMask, TreeNodeIndex myA, TreeNodeIndex myB)
     {
-        atomicAdd(d_p2pCount, 1u);
-        TreeNodeIndex aLeaf = internalToLeaf[a];
-        TreeNodeIndex bLeaf = internalToLeaf[b];
+        using cstone::shflSync;
+        constexpr unsigned ws  = cstone::GpuConfig::warpSize;
+        constexpr int      nwt = 2;
 
-        LocalIndex aFirst = layout[aLeaf];
-        LocalIndex aLast  = layout[aLeaf + 1];
-        LocalIndex bFirst = layout[bLeaf];
-        LocalIndex bLast  = layout[bLeaf + 1];
+        unsigned lane     = threadIdx.x % ws;
+        unsigned p2pCount = __popc(p2pMask);
 
-        for (LocalIndex t = aFirst; t < aLast; ++t)
+        TreeNodeIndex prevA = ~TreeNodeIndex(0);
+        LocalIndex    aFirst = 0, aLast = 0;
+        Vec4<Tacc>    acc[nwt] = {};
+        Vec3<T>       tpos[nwt];
+        T             th[nwt];
+
+        for (unsigned i = 0; i < p2pCount; ++i)
         {
-            Vec4<T> acc{0, 0, 0, 0};
-            Vec3<T> target{x[t], y[t], z[t]};
-            for (LocalIndex s = bFirst; s < bLast; ++s)
+            unsigned tmp = p2pMask;
+            for (unsigned skip = 0; skip < i; ++skip)
+                tmp &= tmp - 1;
+            int srcLane = __ffs(tmp) - 1;
+
+            TreeNodeIndex a = shflSync(myA, srcLane);
+            TreeNodeIndex b = shflSync(myB, srcLane);
+
+            if (a != prevA)
             {
-                acc = ryoanji::P2P(acc, target, Vec3<T>{x[s], y[s], z[s]}, m[s], h[t], h[s]);
+                if (prevA != ~TreeNodeIndex(0))
+                {
+                    for (int k = 0; k < nwt; ++k)
+                    {
+                        LocalIndex t = aFirst + k * ws + lane;
+                        if (t < aLast)
+                        {
+                            LocalIndex ti = t - firstTarget;
+                            atomicAdd(&ppot[ti], acc[k][0]);
+                            atomicAdd(&pax[ti], acc[k][1]);
+                            atomicAdd(&pay[ti], acc[k][2]);
+                            atomicAdd(&paz[ti], acc[k][3]);
+                        }
+                    }
+                }
+
+                prevA = a;
+                TreeNodeIndex aLeaf = internalToLeaf[a];
+                aFirst = layout[aLeaf];
+                aLast  = layout[aLeaf + 1];
+                for (int k = 0; k < nwt; ++k)
+                {
+                    LocalIndex t = aFirst + k * ws + lane;
+                    t            = min(t, aLast - 1);
+                    tpos[k]      = {x[t], y[t], z[t]};
+                    th[k]        = h[t];
+                    acc[k]       = {0, 0, 0, 0};
+                }
+
             }
-            LocalIndex ti = t - firstTarget;
-            atomicAdd(&ppot[ti], acc[0]);
-            atomicAdd(&pax[ti], acc[1]);
-            atomicAdd(&pay[ti], acc[2]);
-            atomicAdd(&paz[ti], acc[3]);
+
+            if constexpr (EnableCounting) { if (lane == 0) atomicAdd(d_p2pCount, 1u); }
+
+            TreeNodeIndex bLeaf  = internalToLeaf[b];
+            LocalIndex    bFirst = layout[bLeaf];
+            LocalIndex    bLast  = layout[bLeaf + 1];
+
+            for (LocalIndex sBase = bFirst; sBase < bLast; sBase += ws)
+            {
+                LocalIndex s  = sBase + lane;
+                T          sx = (s < bLast) ? x[s] : T(0);
+                T          sy = (s < bLast) ? y[s] : T(0);
+                T          sz = (s < bLast) ? z[s] : T(0);
+                T          sm = (s < bLast) ? m[s] : T(0);
+                T          sh = (s < bLast) ? h[s] : T(0);
+
+                int count = min(ws, (unsigned)(bLast - sBase));
+                for (int j = 0; j < count; ++j)
+                {
+                    Vec3<T> sj = {shflSync(sx, j), shflSync(sy, j), shflSync(sz, j)};
+                    T       mj = shflSync(sm, j);
+                    T       hj = shflSync(sh, j);
+
+                    for (int k = 0; k < nwt; ++k)
+                        acc[k] = ryoanji::P2P(acc[k], tpos[k], sj, mj, th[k], hj);
+                }
+            }
+        }
+
+        if (prevA != ~TreeNodeIndex(0))
+        {
+            for (int k = 0; k < nwt; ++k)
+            {
+                LocalIndex t = aFirst + k * ws + lane;
+                if (t < aLast)
+                {
+                    LocalIndex ti = t - firstTarget;
+                    atomicAdd(&ppot[ti], acc[k][0]);
+                    atomicAdd(&pax[ti], acc[k][1]);
+                    atomicAdd(&pay[ti], acc[k][2]);
+                    atomicAdd(&paz[ti], acc[k][3]);
+                }
+            }
         }
     };
 
-    dualTraversalGPU<numWarps, TravConfig>(childOffsets, TreeNodeIndex(0), TreeNodeIndex(0), gq, tq, nProd,
-                                           continuation, m2l, p2p);
+    cstone::dualTraversalGPUStatic<numWarps, TravConfig>(childOffsets, TreeNodeIndex(0), TreeNodeIndex(0), gq, tq, nProd,
+                                                        continuation, m2l, p2p);
 }
 
 // ── Benchmark one (numWarps, TravConfig) combination ─────────────────────────
@@ -381,13 +466,13 @@ FmmTuneResult benchOneFmm(
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
-    fmm::CartesianLocalExpansion<T>* d_locals,
+    fmm::CartesianLocalExpansion<float>* d_locals,
     TreeNodeIndex* d_internalToLeaf,
     TreeNodeIndex* d_leafToInternal,
     ryoanji::LocalIndex* d_layout,
     // Particle arrays on device
     T* d_x, T* d_y, T* d_z, T* d_h, T* d_m,
-    T* d_ppot, T* d_pax, T* d_pay, T* d_paz,
+    float* d_ppot, float* d_pax, float* d_pay, float* d_paz,
     // Parameters
     ryoanji::LocalIndex firstTarget,
     ryoanji::LocalIndex numTargets,
@@ -405,18 +490,19 @@ FmmTuneResult benchOneFmm(
     using ryoanji::Vec4;
     using ryoanji::LocalIndex;
 
-    constexpr unsigned tpb = numWarps * GpuConfig::warpSize;
+    constexpr unsigned tpb  = numWarps * GpuConfig::warpSize;
+    constexpr unsigned kBpc = (numWarps > 4) ? 4u : 8u;
     FmmTuneResult res{};
     res.numWarps = numWarps;
     res.params   = params;
     res.valid    = false;
 
-    unsigned total   = kBpc * 64u;
+    unsigned total   = kBpc * 77u;
     res.totalBlocks  = int(total);
 
     // ── Allocate global interaction queue ──
     constexpr unsigned gChunk = TravConfig::chunkSize;
-    constexpr unsigned gSegs  = 2048;
+    constexpr unsigned gSegs  = 4096;
     constexpr unsigned gCap   = gSegs * gChunk;
 
     TreeNodeIndex *d_gA, *d_gB;
@@ -434,7 +520,7 @@ FmmTuneResult benchOneFmm(
 
     // ── Allocate global traversal queue ──
     constexpr unsigned tChunk = TravConfig::travChunkSize;
-    constexpr unsigned tSegs  = 2048;
+    constexpr unsigned tSegs  = 4096;
     constexpr unsigned tCap   = tSegs * tChunk;
 
     TreeNodeIndex *d_tA, *d_tB;
@@ -465,11 +551,11 @@ FmmTuneResult benchOneFmm(
     // Reset lambda: zeros locals, accumulators, counters, queues
     auto resetAll = [&]()
     {
-        cudaMemset(d_locals, 0, numNodes * sizeof(fmm::CartesianLocalExpansion<T>));
-        cudaMemset(d_ppot, 0, numTargets * sizeof(T));
-        cudaMemset(d_pax, 0, numTargets * sizeof(T));
-        cudaMemset(d_pay, 0, numTargets * sizeof(T));
-        cudaMemset(d_paz, 0, numTargets * sizeof(T));
+        cudaMemset(d_locals, 0, numNodes * sizeof(fmm::CartesianLocalExpansion<float>));
+        cudaMemset(d_ppot, 0, numTargets * sizeof(float));
+        cudaMemset(d_pax, 0, numTargets * sizeof(float));
+        cudaMemset(d_pay, 0, numTargets * sizeof(float));
+        cudaMemset(d_paz, 0, numTargets * sizeof(float));
         cudaMemset(d_m2lCount, 0, sizeof(unsigned));
         cudaMemset(d_p2pCount, 0, sizeof(unsigned));
         cudaMemset(d_wH, 0, sizeof(unsigned));
@@ -482,26 +568,33 @@ FmmTuneResult benchOneFmm(
         cudaMemset(d_nP, 0, sizeof(unsigned));
     };
 
-    // Kernel-only launch lambda (no L2L/L2P)
-    auto launchKernel = [&]()
+    // Kernel launch with counting (for validation)
+    auto launchKernelCounting = [&]()
     {
-        cudaLaunchKernelEx(&cfg, tuneFmmDualTraversalKernel<numWarps, TravConfig, T>,
+        cudaLaunchKernelEx(&cfg, tuneFmmDualTraversalKernel<true, numWarps, TravConfig, T>,
                            d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
                            d_internalToLeaf, d_layout, d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
                            firstTarget, gq, tq, d_nP, d_m2lCount, d_p2pCount);
     };
 
-    // Reset-then-launch lambda for kernel-only timing
+    // Kernel launch without counting (for timed runs — matches production kernel)
+    auto launchKernel = [&]()
+    {
+        cudaLaunchKernelEx(&cfg, tuneFmmDualTraversalKernel<false, numWarps, TravConfig, T>,
+                           d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
+                           d_internalToLeaf, d_layout, d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz,
+                           firstTarget, gq, tq, d_nP, d_m2lCount, d_p2pCount);
+    };
+
+    // Reset-then-launch lambda for kernel-only timing (no counter resets — counting disabled)
     auto resetAndLaunchKernel = [&]()
     {
-        // Reset only what changes between kernel runs (locals, accumulators, counters, queues)
-        cudaMemset(d_locals, 0, numNodes * sizeof(fmm::CartesianLocalExpansion<T>));
-        cudaMemset(d_ppot, 0, numTargets * sizeof(T));
-        cudaMemset(d_pax, 0, numTargets * sizeof(T));
-        cudaMemset(d_pay, 0, numTargets * sizeof(T));
-        cudaMemset(d_paz, 0, numTargets * sizeof(T));
-        cudaMemset(d_m2lCount, 0, sizeof(unsigned));
-        cudaMemset(d_p2pCount, 0, sizeof(unsigned));
+        // Reset only what changes between kernel runs (locals, accumulators, queues)
+        cudaMemset(d_locals, 0, numNodes * sizeof(fmm::CartesianLocalExpansion<float>));
+        cudaMemset(d_ppot, 0, numTargets * sizeof(float));
+        cudaMemset(d_pax, 0, numTargets * sizeof(float));
+        cudaMemset(d_pay, 0, numTargets * sizeof(float));
+        cudaMemset(d_paz, 0, numTargets * sizeof(float));
         cudaMemset(d_wH, 0, sizeof(unsigned));
         cudaMemset(d_rH, 0, sizeof(unsigned));
         cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned));
@@ -515,9 +608,9 @@ FmmTuneResult benchOneFmm(
         printf(".");
     };
 
-    // ── Validation run: full pipeline (kernel + L2L + L2P) ──
+    // ── Validation run: full pipeline (kernel + L2L + L2P) with counting ──
     resetAll();
-    launchKernel();
+    launchKernelCounting();
     cudaError_t err = cudaDeviceSynchronize();
 
     if (err != cudaSuccess)
@@ -569,8 +662,8 @@ FmmTuneResult benchOneFmm(
         }
 
         // Download and compute energy
-        std::vector<T> h_ppot(numTargets);
-        cudaMemcpy(h_ppot.data(), d_ppot, numTargets * sizeof(T), cudaMemcpyDeviceToHost);
+        std::vector<float> h_ppot(numTargets);
+        cudaMemcpy(h_ppot.data(), d_ppot, numTargets * sizeof(float), cudaMemcpyDeviceToHost);
 
         LocalIndex lastTarget = firstTarget + numTargets;
         T ugravLoc = 0;
@@ -625,12 +718,12 @@ void benchAndRecord(
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
-    fmm::CartesianLocalExpansion<T>* d_locals,
+    fmm::CartesianLocalExpansion<float>* d_locals,
     TreeNodeIndex* d_internalToLeaf,
     TreeNodeIndex* d_leafToInternal,
     ryoanji::LocalIndex* d_layout,
     T* d_x, T* d_y, T* d_z, T* d_h, T* d_m,
-    T* d_ppot, T* d_pax, T* d_pay, T* d_paz,
+    float* d_ppot, float* d_pax, float* d_pay, float* d_paz,
     ryoanji::LocalIndex firstTarget,
     ryoanji::LocalIndex numTargets,
     TreeNodeIndex numNodes,
@@ -678,12 +771,12 @@ void benchAllConfigs(
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
-    fmm::CartesianLocalExpansion<T>* d_locals,
+    fmm::CartesianLocalExpansion<float>* d_locals,
     TreeNodeIndex* d_internalToLeaf,
     TreeNodeIndex* d_leafToInternal,
     ryoanji::LocalIndex* d_layout,
     T* d_x, T* d_y, T* d_z, T* d_h, T* d_m,
-    T* d_ppot, T* d_pax, T* d_pay, T* d_paz,
+    float* d_ppot, float* d_pax, float* d_pay, float* d_paz,
     ryoanji::LocalIndex firstTarget,
     ryoanji::LocalIndex numTargets,
     TreeNodeIndex numNodes,
@@ -717,12 +810,12 @@ void dispatchWarps(
     ryoanji::Vec3<T>* d_geoSizes,
     ryoanji::Vec4<T>* d_centers,
     fmm::CartesianMultipole<T>* d_multipoles,
-    fmm::CartesianLocalExpansion<T>* d_locals,
+    fmm::CartesianLocalExpansion<float>* d_locals,
     TreeNodeIndex* d_internalToLeaf,
     TreeNodeIndex* d_leafToInternal,
     ryoanji::LocalIndex* d_layout,
     T* d_x, T* d_y, T* d_z, T* d_h, T* d_m,
-    T* d_ppot, T* d_pax, T* d_pay, T* d_paz,
+    float* d_ppot, float* d_pax, float* d_pay, float* d_paz,
     ryoanji::LocalIndex firstTarget,
     ryoanji::LocalIndex numTargets,
     TreeNodeIndex numNodes,
@@ -762,7 +855,7 @@ void dispatchWarps(
 
 // ── Main benchmark ────────────────────────────────────────────────────────────
 
-void tuneCartFmmBenchmark(unsigned numParticles = 200000,
+void tuneCartFmmBenchmark(unsigned numParticles = 20000000,
                            unsigned bucketSize   = 64,
                            unsigned numWarmup    = 3,
                            unsigned numRuns      = 10)
@@ -771,7 +864,7 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     using KeyType       = uint64_t;
     using MultipoleType = fmm::CartesianMultipole<T>;
 
-    float          theta = 0.7;
+    float          theta = 0.5;
     float          G     = 1.0;
     cstone::Box<T> box(-1, 1);
 
@@ -849,8 +942,8 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
 
     printf("  particles=%u  leaves=%d  nodes=%d  bucket=%u  (Cartesian quadrupole)\n",
            numParticles, numLeaves, numNodes, bucketSize);
-    printf("  warmup=%u  runs=%u  bpc=%u  configs=%zu  numWarps values=%zu\n",
-           numWarmup, numRuns, kBpc, numTuneConfigs, TuneWarpList::size());
+    printf("  warmup=%u  runs=%u  bpc=8(nW<=5)/2(nW>5)  configs=%zu  numWarps values=%zu\n",
+           numWarmup, numRuns, numTuneConfigs, TuneWarpList::size());
     printf("════════════════════════════════════════════════════════════════════════════════\n");
 
     // ════════════════════════════════════════════════════════════════════════
@@ -978,14 +1071,14 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
     checkGpuErrors(cudaDeviceSynchronize());
 
     // Allocate locals and particle accumulators (re-zeroed per config run)
-    fmm::CartesianLocalExpansion<T>* d_locals;
-    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(fmm::CartesianLocalExpansion<T>)));
+    fmm::CartesianLocalExpansion<float>* d_locals;
+    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(fmm::CartesianLocalExpansion<float>)));
 
-    T *d_ppot, *d_pax, *d_pay, *d_paz;
-    checkGpuErrors(cudaMalloc(&d_ppot, numTargets * sizeof(T)));
-    checkGpuErrors(cudaMalloc(&d_pax, numTargets * sizeof(T)));
-    checkGpuErrors(cudaMalloc(&d_pay, numTargets * sizeof(T)));
-    checkGpuErrors(cudaMalloc(&d_paz, numTargets * sizeof(T)));
+    float *d_ppot, *d_pax, *d_pay, *d_paz;
+    checkGpuErrors(cudaMalloc(&d_ppot, numTargets * sizeof(float)));
+    checkGpuErrors(cudaMalloc(&d_pax, numTargets * sizeof(float)));
+    checkGpuErrors(cudaMalloc(&d_pay, numTargets * sizeof(float)));
+    checkGpuErrors(cudaMalloc(&d_paz, numTargets * sizeof(float)));
 
     printf("  GPU setup complete. numNodes=%d numTargets=%d\n", numNodes, numTargets);
 
@@ -1183,4 +1276,4 @@ void tuneCartFmmBenchmark(unsigned numParticles = 200000,
 
 } // anonymous namespace
 
-TEST(CartesianFMM, tuneCartFmmBenchmark) { tuneCartFmmBenchmark(200000, 64, 3, 10); }
+TEST(CartesianFMM, tuneCartFmmBenchmark) { tuneCartFmmBenchmark(20000000, 64, 3, 10); }

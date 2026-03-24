@@ -26,6 +26,7 @@
 
 #include "cstone/cuda/cuda_utils.cuh"
 #include "cstone/cuda/gpu_config.cuh"
+#include "cstone/focus/source_center_gpu.h"
 #include "cstone/primitives/math.hpp"
 #include "cstone/primitives/warpscan.cuh"
 #include "cstone/tree/octree.hpp"
@@ -96,6 +97,84 @@ __device__ void M2LGpu(const Vec3<T>& targetCenter, const Vec3<T>& sourceCenter,
 
     atomicAdd(&((*local)[Cli::tzz]), Tacc(mono5 * (T(3) * Rz * Rz - r2) + multipole[Cqi::qzz] * r_minus5 -
                                       T(10) * QRz * Rz * r_minus7 - T(2.5) * rQr_r7 + T(17.5) * rQr_r9 * Rz * Rz));
+}
+
+// ---------------------------------------------------------------------------
+// M2L device function — FMA-optimized, register-local output, templatized on compute precision
+// ---------------------------------------------------------------------------
+
+/*! @brief Compute M2L contribution into a register-local expansion (no atomicAdd)
+ *
+ * @tparam Tc   Compute precision (float for mixed-precision, T for full precision)
+ * @tparam T    Storage precision of positions/multipoles (typically double)
+ * @tparam Tacc Accumulator precision of the local expansion (typically float)
+ *
+ * Displacement R is computed in T (full precision) then truncated to Tc,
+ * avoiding catastrophic cancellation. All subsequent math uses Tc.
+ * Explicit fma() calls guide nvcc to emit fused multiply-add instructions.
+ */
+template<class Tc, class T, class Tacc>
+__device__ void M2LGpuCompute(const Vec3<T>& targetCenter, const Vec3<T>& sourceCenter,
+                               const CartesianMultipole<T>& multipole,
+                               CartesianLocalExpansion<Tacc>& local)
+{
+    Tc Rx = Tc(targetCenter[0] - sourceCenter[0]);
+    Tc Ry = Tc(targetCenter[1] - sourceCenter[1]);
+    Tc Rz = Tc(targetCenter[2] - sourceCenter[2]);
+
+    Tc r2       = fma(Rx, Rx, fma(Ry, Ry, Rz * Rz));
+    Tc r_minus1 = ryoanji::inverseSquareRoot(r2);
+    Tc r_minus2 = r_minus1 * r_minus1;
+    Tc r_minus3 = r_minus2 * r_minus1;
+    Tc r_minus5 = r_minus3 * r_minus2;
+    Tc r_minus7 = r_minus5 * r_minus2;
+    Tc r_minus9 = r_minus7 * r_minus2;
+
+    Tc M = Tc(multipole[Cqi::mass]);
+
+    Tc qxx = Tc(multipole[Cqi::qxx]), qxy = Tc(multipole[Cqi::qxy]), qxz = Tc(multipole[Cqi::qxz]);
+    Tc qyy = Tc(multipole[Cqi::qyy]), qyz = Tc(multipole[Cqi::qyz]), qzz = Tc(multipole[Cqi::qzz]);
+
+    Tc QRx = fma(qxx, Rx, fma(qxy, Ry, qxz * Rz));
+    Tc QRy = fma(qxy, Rx, fma(qyy, Ry, qyz * Rz));
+    Tc QRz = fma(qxz, Rx, fma(qyz, Ry, qzz * Rz));
+
+    Tc rQr = fma(Rx, QRx, fma(Ry, QRy, Rz * QRz));
+
+    Tc mono5  = M * r_minus5;
+    Tc rQr_r7 = rQr * r_minus7;
+    Tc rQr_r9 = rQr * r_minus9;
+
+    // L0: potential
+    local[Cli::pot] += Tacc(fma(Tc(0.5) * rQr, r_minus5, M * r_minus1));
+
+    // Li: gradient — factor R_i out of all three terms
+    Tc gcoeff = fma(Tc(-2.5), rQr_r7, -M * r_minus3);
+    local[Cli::gx] += Tacc(fma(gcoeff, Rx, QRx * r_minus5));
+    local[Cli::gy] += Tacc(fma(gcoeff, Ry, QRy * r_minus5));
+    local[Cli::gz] += Tacc(fma(gcoeff, Rz, QRz * r_minus5));
+
+    // Lij: tidal tensor — precompute shared coefficients
+    Tc RR_coeff   = fma(Tc(3), mono5, Tc(17.5) * rQr_r9);
+    Tc diag_const = fma(-mono5, r2, Tc(-2.5) * rQr_r7);
+    Tc neg5_r7    = Tc(-5) * r_minus7;
+    Tc neg10_r7   = Tc(-10) * r_minus7;
+
+    // Diagonal: tii = RR_coeff * Ri^2 + diag_const + qii/r^5 - 10*QRi*Ri/r^7
+    local[Cli::txx] += Tacc(fma(RR_coeff, Rx * Rx, diag_const) +
+                            fma(neg10_r7 * QRx, Rx, qxx * r_minus5));
+    local[Cli::tyy] += Tacc(fma(RR_coeff, Ry * Ry, diag_const) +
+                            fma(neg10_r7 * QRy, Ry, qyy * r_minus5));
+    local[Cli::tzz] += Tacc(fma(RR_coeff, Rz * Rz, diag_const) +
+                            fma(neg10_r7 * QRz, Rz, qzz * r_minus5));
+
+    // Off-diagonal: tij = RR_coeff * Ri*Rj + qij/r^5 - 5*(QRi*Rj + QRj*Ri)/r^7
+    local[Cli::txy] += Tacc(fma(RR_coeff, Rx * Ry,
+                                fma(neg5_r7, fma(QRx, Ry, QRy * Rx), qxy * r_minus5)));
+    local[Cli::txz] += Tacc(fma(RR_coeff, Rx * Rz,
+                                fma(neg5_r7, fma(QRx, Rz, QRz * Rx), qxz * r_minus5)));
+    local[Cli::tyz] += Tacc(fma(RR_coeff, Ry * Rz,
+                                fma(neg5_r7, fma(QRy, Rz, QRz * Ry), qyz * r_minus5)));
 }
 
 // ---------------------------------------------------------------------------
@@ -326,38 +405,119 @@ __global__ void cartFmmDualTraversalKernel(const TreeNodeIndex* __restrict__ chi
 
     auto m2l = [centers, multipoles, locals] __device__(TreeNodeIndex a, TreeNodeIndex b)
     {
-        M2LGpu(util::makeVec3(centers[a]), util::makeVec3(centers[b]), multipoles[b], &locals[a]);
+        CartesianLocalExpansion<Tacc> partial{};
+        M2LGpuCompute<float>(util::makeVec3(centers[a]), util::makeVec3(centers[b]), multipoles[b], partial);
+        for (int c = 0; c < 10; ++c)
+            atomicAdd(&locals[a][c], partial[c]);
     };
 
     auto p2p = [internalToLeaf, layout, x, y, z, h, m, ppot, pax, pay, paz,
-                firstTarget] __device__(TreeNodeIndex a, TreeNodeIndex b)
+                firstTarget] __device__(unsigned p2pMask, TreeNodeIndex myA, TreeNodeIndex myB)
     {
-        TreeNodeIndex aLeaf = internalToLeaf[a];
-        TreeNodeIndex bLeaf = internalToLeaf[b];
+        using cstone::shflSync;
+        constexpr unsigned ws  = cstone::GpuConfig::warpSize;
+        constexpr int      nwt = 2;
 
-        LocalIndex aFirst = layout[aLeaf];
-        LocalIndex aLast  = layout[aLeaf + 1];
-        LocalIndex bFirst = layout[bLeaf];
-        LocalIndex bLast  = layout[bLeaf + 1];
+        unsigned lane     = threadIdx.x % ws;
+        unsigned p2pCount = __popc(p2pMask);
 
-        for (LocalIndex t = aFirst; t < aLast; ++t)
+        TreeNodeIndex prevA = ~TreeNodeIndex(0);
+        LocalIndex    aFirst = 0, aLast = 0;
+        Vec4<Tacc>    acc[nwt] = {};
+        Vec3<T>       tpos[nwt];
+        T             th[nwt];
+
+        for (unsigned i = 0; i < p2pCount; ++i)
         {
-            Vec4<Tacc> acc{0, 0, 0, 0};
-            Vec3<T>    target{x[t], y[t], z[t]};
-            for (LocalIndex s = bFirst; s < bLast; ++s)
+            // Find lane holding the i-th P2P item
+            unsigned tmp = p2pMask;
+            for (unsigned skip = 0; skip < i; ++skip)
+                tmp &= tmp - 1; // clear lowest set bit
+            int srcLane = __ffs(tmp) - 1;
+
+            TreeNodeIndex a = shflSync(myA, srcLane);
+            TreeNodeIndex b = shflSync(myB, srcLane);
+
+            // Target cell changed — flush accumulators and load new targets
+            if (a != prevA)
             {
-                acc = ryoanji::P2P(acc, target, Vec3<T>{x[s], y[s], z[s]}, m[s], h[t], h[s]);
+                if (prevA != ~TreeNodeIndex(0))
+                {
+                    for (int k = 0; k < nwt; ++k)
+                    {
+                        LocalIndex t = aFirst + k * ws + lane;
+                        if (t < aLast)
+                        {
+                            LocalIndex ti = t - firstTarget;
+                            atomicAdd(&ppot[ti], acc[k][0]);
+                            atomicAdd(&pax[ti], acc[k][1]);
+                            atomicAdd(&pay[ti], acc[k][2]);
+                            atomicAdd(&paz[ti], acc[k][3]);
+                        }
+                    }
+                }
+
+                prevA = a;
+                TreeNodeIndex aLeaf = internalToLeaf[a];
+                aFirst = layout[aLeaf];
+                aLast  = layout[aLeaf + 1];
+                for (int k = 0; k < nwt; ++k)
+                {
+                    LocalIndex t = aFirst + k * ws + lane;
+                    t            = min(t, aLast - 1);
+                    tpos[k]      = {x[t], y[t], z[t]};
+                    th[k]        = h[t];
+                    acc[k]       = {0, 0, 0, 0};
+                }
             }
-            LocalIndex ti = t - firstTarget;
-            atomicAdd(&ppot[ti], acc[0]);
-            atomicAdd(&pax[ti], acc[1]);
-            atomicAdd(&pay[ti], acc[2]);
-            atomicAdd(&paz[ti], acc[3]);
+
+            // Source cell b: broadcast sources across warp (BH directAcc pattern)
+            TreeNodeIndex bLeaf  = internalToLeaf[b];
+            LocalIndex    bFirst = layout[bLeaf];
+            LocalIndex    bLast  = layout[bLeaf + 1];
+
+            for (LocalIndex sBase = bFirst; sBase < bLast; sBase += ws)
+            {
+                LocalIndex s  = sBase + lane;
+                T          sx = (s < bLast) ? x[s] : T(0);
+                T          sy = (s < bLast) ? y[s] : T(0);
+                T          sz = (s < bLast) ? z[s] : T(0);
+                T          sm = (s < bLast) ? m[s] : T(0);
+                T          sh = (s < bLast) ? h[s] : T(0);
+
+                int count = min(ws, (unsigned)(bLast - sBase));
+                for (int j = 0; j < count; ++j)
+                {
+                    Vec3<T> sj = {shflSync(sx, j), shflSync(sy, j), shflSync(sz, j)};
+                    T       mj = shflSync(sm, j);
+                    T       hj = shflSync(sh, j);
+
+                    for (int k = 0; k < nwt; ++k)
+                        acc[k] = ryoanji::P2P(acc[k], tpos[k], sj, mj, th[k], hj);
+                }
+            }
+        }
+
+        // Flush final target accumulators
+        if (prevA != ~TreeNodeIndex(0))
+        {
+            for (int k = 0; k < nwt; ++k)
+            {
+                LocalIndex t = aFirst + k * ws + lane;
+                if (t < aLast)
+                {
+                    LocalIndex ti = t - firstTarget;
+                    atomicAdd(&ppot[ti], acc[k][0]);
+                    atomicAdd(&pax[ti], acc[k][1]);
+                    atomicAdd(&pay[ti], acc[k][2]);
+                    atomicAdd(&paz[ti], acc[k][3]);
+                }
+            }
         }
     };
 
-    cstone::dualTraversalGPU<numWarps, CartTravConfig>(childOffsets, TreeNodeIndex(0), TreeNodeIndex(0), gq, tq, nProd,
-                                                       continuation, m2l, p2p);
+    cstone::dualTraversalGPUStatic<numWarps, CartTravConfig>(childOffsets, TreeNodeIndex(0), TreeNodeIndex(0), gq, tq,
+                                                             nProd, continuation, m2l, p2p);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +542,7 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
                            LocalIndex numParticles,
                            FmmGpuStats* stats = nullptr)
 {
-    using Tacc = T;
+    using Tacc = float;
 
     TreeNodeIndex numNodes    = levelRange.back();
     TreeNodeIndex numLeaves   = TreeNodeIndex(leafToInternalMap.size());
@@ -544,12 +704,9 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     constexpr unsigned numWarps          = CartDualConfig::numWarps;
     constexpr unsigned threadsPerBlock   = CartDualConfig::numThreadsPerBlock;
 
-    unsigned maxBlocks = cstone::maxConcurrentBlocks(
-        cartFmmDualTraversalKernel<macType, numWarps, T, Tacc>, threadsPerBlock, kBlocksPerCluster);
-    unsigned totalBlocks = maxBlocks;
+    unsigned totalBlocks = kBlocksPerCluster * 64u;
 
-    printf("[CartesianFMM GPU] Launching %u blocks (%u clusters of %u)\n",
-           totalBlocks, totalBlocks / kBlocksPerCluster, kBlocksPerCluster);
+    // Block/cluster count available via totalBlocks / kBlocksPerCluster
 
     cudaLaunchConfig_t    dualCfg{};
     dualCfg.gridDim  = {totalBlocks, 1, 1};
@@ -606,8 +763,7 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     checkGpuErrors(cudaEventElapsedTime(&msL2P, evL2PStart, evL2PEnd));
     float msTotal = msUpsweep + msTrav + msL2L + msL2P;
 
-    printf("[CartesianFMM GPU] P2M+M2M: %.3f ms | Traversal: %.3f ms | L2L: %.3f ms | L2P: %.3f ms | Total: %.3f ms\n",
-           msUpsweep, msTrav, msL2L, msL2P, msTotal);
+    // Timing available via FmmGpuStats output parameter
 
     if (stats) { *stats = {msUpsweep, msTrav, msL2L, msL2P}; }
 
@@ -679,6 +835,291 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     cudaFree(d_trHead);
     cudaFree(d_tsegR);
 
+}
+
+// ---------------------------------------------------------------------------
+// Helper kernels for GPU-native path
+// ---------------------------------------------------------------------------
+
+template<class T>
+__global__ void scaleVec3Kernel(Vec3<T>* data, TreeNodeIndex n, T factor)
+{
+    TreeNodeIndex i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        data[i][0] *= factor;
+        data[i][1] *= factor;
+        data[i][2] *= factor;
+    }
+}
+
+template<class T, class Tacc>
+__global__ void applyGScalingKernel(LocalIndex n, float G,
+                                     const Tacc* pax, const Tacc* pay, const Tacc* paz,
+                                     T* ax, T* ay, T* az)
+{
+    LocalIndex i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        ax[i] += T(G) * T(pax[i]);
+        ay[i] += T(G) * T(pay[i]);
+        az[i] += T(G) * T(paz[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-native overload — takes device pointers, no CPU upload/download
+// ---------------------------------------------------------------------------
+
+template<MacVariant macType = ScalarMac, class T, class KeyType>
+void computeGravityFMMGpu(
+    const KeyType* d_prefixes, const TreeNodeIndex* d_childOffsets,
+    const TreeNodeIndex* d_internalToLeaf, const TreeNodeIndex* d_leafToInternal,
+    const LocalIndex* d_layout, const cstone::SourceCenterType<T>* d_centers,
+    std::span<const TreeNodeIndex> levelRange,
+    TreeNodeIndex numNodes, TreeNodeIndex numLeaves,
+    const T* d_x, const T* d_y, const T* d_z, const T* d_h, const T* d_m,
+    const cstone::Box<T>& box, float G, float invTheta,
+    T* d_ax, T* d_ay, T* d_az,
+    T* ugravTot, LocalIndex numParticles,
+    FmmGpuStats* stats)
+{
+    using Tacc = float;
+
+    LocalIndex firstTarget = 0;
+    LocalIndex numTargets  = numParticles;
+
+    // 1. Compute geometric centers/sizes on GPU from SFC prefixes
+    Vec3<T>* d_geoCenters;
+    Vec3<T>* d_geoSizes;
+    checkGpuErrors(cudaMalloc(&d_geoCenters, numNodes * sizeof(Vec3<T>)));
+    checkGpuErrors(cudaMalloc(&d_geoSizes, numNodes * sizeof(Vec3<T>)));
+    cstone::computeGeoCentersGpu(d_prefixes, numNodes, d_geoCenters, d_geoSizes, box);
+
+    // Scale geo sizes by invTheta for scalar MAC
+    if constexpr (macType == ScalarMac)
+    {
+        int nt = 256;
+        int nb = cstone::iceil(numNodes, nt);
+        if (nb) { scaleVec3Kernel<<<nb, nt>>>(d_geoSizes, numNodes, T(invTheta)); }
+    }
+
+    // 2. Create CUDA events for phase timing
+    cudaEvent_t evUpsweepStart, evUpsweepEnd, evTravStart, evTravEnd;
+    cudaEvent_t evL2LStart, evL2LEnd, evL2PStart, evL2PEnd;
+    checkGpuErrors(cudaEventCreate(&evUpsweepStart));
+    checkGpuErrors(cudaEventCreate(&evUpsweepEnd));
+    checkGpuErrors(cudaEventCreate(&evTravStart));
+    checkGpuErrors(cudaEventCreate(&evTravEnd));
+    checkGpuErrors(cudaEventCreate(&evL2LStart));
+    checkGpuErrors(cudaEventCreate(&evL2LEnd));
+    checkGpuErrors(cudaEventCreate(&evL2PStart));
+    checkGpuErrors(cudaEventCreate(&evL2PEnd));
+
+    // 3. Allocate device multipoles and compute P2M + M2M on GPU
+    CartesianMultipole<T>* d_multipoles;
+    checkGpuErrors(cudaMalloc(&d_multipoles, numNodes * sizeof(CartesianMultipole<T>)));
+    checkGpuErrors(cudaMemset(d_multipoles, 0, numNodes * sizeof(CartesianMultipole<T>)));
+
+    checkGpuErrors(cudaEventRecord(evUpsweepStart));
+
+    computeLeafMultipolesGpu(d_x, d_y, d_z, d_m, d_leafToInternal, numLeaves, d_layout, d_centers, d_multipoles);
+    upsweepMultipolesGpu(levelRange, d_childOffsets, d_centers, d_multipoles);
+
+    checkGpuErrors(cudaEventRecord(evUpsweepEnd));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 4. Allocate + zero-init device locals and particle accumulators
+    CartesianLocalExpansion<Tacc>* d_locals;
+    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(CartesianLocalExpansion<Tacc>)));
+    checkGpuErrors(cudaMemset(d_locals, 0, numNodes * sizeof(CartesianLocalExpansion<Tacc>)));
+
+    Tacc *d_ppot, *d_pax, *d_pay, *d_paz;
+    checkGpuErrors(cudaMalloc(&d_ppot, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMalloc(&d_pax, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMalloc(&d_pay, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMalloc(&d_paz, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_ppot, 0, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_pax, 0, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_pay, 0, numTargets * sizeof(Tacc)));
+    checkGpuErrors(cudaMemset(d_paz, 0, numTargets * sizeof(Tacc)));
+
+    // 5. Allocate global work queues for dual traversal
+    constexpr unsigned gChunk = CartTravConfig::chunkSize;
+    constexpr unsigned gSegs  = 2048;
+    constexpr unsigned gCap   = gSegs * gChunk;
+
+    TreeNodeIndex* d_gA;
+    TreeNodeIndex* d_gB;
+    int*           d_gIsP2P;
+    unsigned*      d_wHead;
+    unsigned*      d_rHead;
+    unsigned*      d_segCount;
+    unsigned*      d_segR;
+    unsigned*      d_nProd;
+
+    checkGpuErrors(cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_gIsP2P, gCap * sizeof(int)));
+    checkGpuErrors(cudaMalloc(&d_wHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_rHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_segCount, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_segR, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_nProd, sizeof(unsigned)));
+
+    cstone::GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
+
+    constexpr unsigned tChunk = CartTravConfig::travChunkSize;
+    constexpr unsigned tSegs  = 2048;
+    constexpr unsigned tCap   = tSegs * tChunk;
+
+    TreeNodeIndex* d_tA;
+    TreeNodeIndex* d_tB;
+    unsigned*      d_twHead;
+    unsigned*      d_trHead;
+    unsigned*      d_tsegR;
+
+    checkGpuErrors(cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_tB, tCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_twHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_trHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned)));
+
+    cstone::GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
+
+    // 6. Reset queues
+    checkGpuErrors(cudaMemset(d_wHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_rHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_segR, 0, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_twHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_trHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned)));
+
+    // 7. Configure cluster launch
+    constexpr unsigned kBlocksPerCluster = CartDualConfig::kBlocksPerCluster;
+    constexpr unsigned numWarps          = CartDualConfig::numWarps;
+    constexpr unsigned threadsPerBlock   = CartDualConfig::numThreadsPerBlock;
+
+    unsigned totalBlocks = kBlocksPerCluster * 64u;
+
+    cudaLaunchConfig_t    dualCfg{};
+    dualCfg.gridDim  = {totalBlocks, 1, 1};
+    dualCfg.blockDim = {threadsPerBlock, 1, 1};
+    cudaLaunchAttribute dualAttr{};
+    dualAttr.id               = cudaLaunchAttributeClusterDimension;
+    dualAttr.val.clusterDim.x = kBlocksPerCluster;
+    dualAttr.val.clusterDim.y = 1;
+    dualAttr.val.clusterDim.z = 1;
+    dualCfg.attrs    = &dualAttr;
+    dualCfg.numAttrs = 1;
+
+    checkGpuErrors(cudaMemset(d_nProd, 0, sizeof(unsigned)));
+
+    // 8. Launch dual traversal
+    checkGpuErrors(cudaEventRecord(evTravStart));
+
+    checkGpuErrors(cudaLaunchKernelEx(&dualCfg, cartFmmDualTraversalKernel<macType, numWarps, T, Tacc>,
+                                      d_childOffsets,
+                                      d_geoCenters, d_geoSizes,
+                                      d_centers, d_multipoles, d_locals, d_internalToLeaf, d_layout, d_x,
+                                      d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz, firstTarget,
+                                      gq, tq, d_nProd));
+
+    checkGpuErrors(cudaEventRecord(evTravEnd));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 9. L2L downsweep
+    checkGpuErrors(cudaEventRecord(evL2LStart));
+    downsweepLocalExpansionsGpu(levelRange, d_childOffsets, d_centers, d_locals);
+    checkGpuErrors(cudaEventRecord(evL2LEnd));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 10. L2P
+    checkGpuErrors(cudaEventRecord(evL2PStart));
+    {
+        constexpr int numThreadsL2P = 256;
+        if (numLeaves > 0)
+        {
+            l2pKernel<<<(numLeaves + numThreadsL2P - 1) / numThreadsL2P, numThreadsL2P>>>(
+                0, numLeaves, d_leafToInternal, d_layout, d_centers, d_locals, d_x, d_y, d_z, d_ppot,
+                d_pax, d_pay, d_paz, firstTarget);
+        }
+    }
+    checkGpuErrors(cudaEventRecord(evL2PEnd));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 11. Timing
+    float msUpsweep, msTrav, msL2L, msL2P;
+    checkGpuErrors(cudaEventElapsedTime(&msUpsweep, evUpsweepStart, evUpsweepEnd));
+    checkGpuErrors(cudaEventElapsedTime(&msTrav, evTravStart, evTravEnd));
+    checkGpuErrors(cudaEventElapsedTime(&msL2L, evL2LStart, evL2LEnd));
+    checkGpuErrors(cudaEventElapsedTime(&msL2P, evL2PStart, evL2PEnd));
+
+    if (stats) { *stats = {msUpsweep, msTrav, msL2L, msL2P}; }
+
+    checkGpuErrors(cudaEventDestroy(evUpsweepStart));
+    checkGpuErrors(cudaEventDestroy(evUpsweepEnd));
+    checkGpuErrors(cudaEventDestroy(evTravStart));
+    checkGpuErrors(cudaEventDestroy(evTravEnd));
+    checkGpuErrors(cudaEventDestroy(evL2LStart));
+    checkGpuErrors(cudaEventDestroy(evL2LEnd));
+    checkGpuErrors(cudaEventDestroy(evL2PStart));
+    checkGpuErrors(cudaEventDestroy(evL2PEnd));
+
+    // 12. Apply G-scaling on GPU and accumulate into caller's output buffers
+    {
+        int nt = 256;
+        int nb = cstone::iceil(numTargets, nt);
+        if (nb)
+        {
+            applyGScalingKernel<<<nb, nt>>>(numTargets, G, d_pax, d_pay, d_paz,
+                                            d_ax, d_ay, d_az);
+        }
+    }
+
+    // 13. Download potential sum for ugravTot (small scalar)
+    if (ugravTot)
+    {
+        // Compute ugrav = sum(G * m[i] * ppot[i]) / 2 on host
+        std::vector<Tacc> h_ppot(numTargets);
+        std::vector<T>    h_m(numTargets);
+        checkGpuErrors(cudaMemcpy(h_ppot.data(), d_ppot, numTargets * sizeof(Tacc), cudaMemcpyDeviceToHost));
+        checkGpuErrors(cudaMemcpy(h_m.data(), d_m, numTargets * sizeof(T), cudaMemcpyDeviceToHost));
+        T ugravLoc = 0;
+        for (LocalIndex i = 0; i < numTargets; ++i)
+            ugravLoc += G * h_m[i] * h_ppot[i];
+        *ugravTot += T(0.5) * ugravLoc;
+    }
+
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 14. Free internally-allocated temporaries (caller owns input device pointers)
+    cudaFree(d_geoCenters);
+    cudaFree(d_geoSizes);
+
+    cudaFree(d_multipoles);
+    cudaFree(d_locals);
+
+    cudaFree(d_ppot);
+    cudaFree(d_pax);
+    cudaFree(d_pay);
+    cudaFree(d_paz);
+
+    cudaFree(d_gA);
+    cudaFree(d_gB);
+    cudaFree(d_gIsP2P);
+    cudaFree(d_wHead);
+    cudaFree(d_rHead);
+    cudaFree(d_segCount);
+    cudaFree(d_segR);
+    cudaFree(d_nProd);
+
+    cudaFree(d_tA);
+    cudaFree(d_tB);
+    cudaFree(d_twHead);
+    cudaFree(d_trHead);
+    cudaFree(d_tsegR);
 }
 
 } // namespace fmm

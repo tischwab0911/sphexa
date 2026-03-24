@@ -63,10 +63,10 @@ HOST_DEVICE_FUN DEVICE_INLINE Vec4<Ta> P2P(Vec4<Ta> acc, const Vec3<Tc>& pos_i, 
     Tc invR2  = invR * invR;
     Tc invR3m = m_j * invR * invR2;
 
-    acc[0] -= invR3m * R2;
-    acc[1] += dX[0] * invR3m;
-    acc[2] += dX[1] * invR3m;
-    acc[3] += dX[2] * invR3m;
+    acc[0] = Ta(fma(-invR3m, R2, Tc(acc[0])));
+    acc[1] = Ta(fma(dX[0], invR3m, Tc(acc[1])));
+    acc[2] = Ta(fma(dX[1], invR3m, Tc(acc[2])));
+    acc[3] = Ta(fma(dX[2], invR3m, Tc(acc[3])));
 
     return acc;
 }

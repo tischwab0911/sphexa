@@ -273,7 +273,7 @@ struct FmmTuneResult
 
 // ── Compile-time mapping: TuneParams[I] -> TraversalConfig<...> ──────────────
 
-template<size_t I>
+template<size_t I, int NW>
 using FmmTuneTravConfig = TraversalConfig<tuneConfigs[I].stackCap,
                                           tuneConfigs[I].chunkSize,
                                           tuneConfigs[I].forcePush,
@@ -284,7 +284,7 @@ using FmmTuneTravConfig = TraversalConfig<tuneConfigs[I].stackCap,
                                           tuneConfigs[I].travForcePush,
                                           tuneConfigs[I].travAttemptPush,
                                           tuneConfigs[I].travAttemptPop,
-                                          1>;
+                                          (NW > 5) ? 2 : 1>;
 
 // ── FMM dual traversal kernel with TravConfig as template parameter ──────────
 
@@ -345,8 +345,10 @@ __global__ void tuneFmmDualTraversalKernel(
     };
 
     auto p2p = [internalToLeaf, layout, x, y, z, h, m, ppot, pax, pay, paz, firstTarget,
-                d_p2pCount] __device__(TreeNodeIndex a, TreeNodeIndex b)
+                d_p2pCount] __device__(unsigned p2pMask, TreeNodeIndex a, TreeNodeIndex b)
     {
+        unsigned lane = threadIdx.x % cstone::GpuConfig::warpSize;
+        if (!((p2pMask >> lane) & 1u)) return;
         atomicAdd(d_p2pCount, 1u);
         TreeNodeIndex aLeaf = internalToLeaf[a];
         TreeNodeIndex bLeaf = internalToLeaf[b];
@@ -658,7 +660,7 @@ void benchAndRecord(
            c.travChunkSize, c.travForcePush, c.travAttemptPush, c.travAttemptPop);
     fflush(stdout);
 
-    auto r = benchOneFmm<NW, FmmTuneTravConfig<CI>, T>(
+    auto r = benchOneFmm<NW, FmmTuneTravConfig<CI, NW>, T>(
         c,
         d_childOffsets, d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals,
         d_internalToLeaf, d_leafToInternal, d_layout,

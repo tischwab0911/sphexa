@@ -51,7 +51,7 @@ if(CMAKE_CUDA_COMPILER OR CMAKE_HIP_COMPILER)
     target_compile_options(${cart_tune_testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
     target_include_directories(${cart_tune_testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
     target_link_libraries(${cart_tune_testname} PRIVATE
-        cstone_gpu cstone_thrust_incl
+        cstone_gpu cstone_thrust_incl ryoanji_kernels
         GTest::gtest_main OpenMP::OpenMP_CXX)
     if(CMAKE_CUDA_COMPILER)
         target_compile_options(${cart_tune_testname} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
@@ -59,6 +59,19 @@ if(CMAKE_CUDA_COMPILER OR CMAKE_HIP_COMPILER)
     endif()
     set_target_properties(${cart_tune_testname} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     add_test(NAME ${cart_tune_testname} COMMAND ${cart_tune_testname})
+
+    set(profile_testname fmm_profile_benchmark)
+    add_executable(${profile_testname} profile_cartesian_fmm.cu test_main.cpp)
+    target_compile_options(${profile_testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
+    target_include_directories(${profile_testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
+    target_link_libraries(${profile_testname} PRIVATE
+        cstone_gpu cstone_thrust_incl ryoanji_kernels
+        GTest::gtest_main OpenMP::OpenMP_CXX)
+    if(CMAKE_CUDA_COMPILER)
+        target_compile_options(${profile_testname} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+        target_link_libraries(${profile_testname} PRIVATE CUDA::cudart)
+    endif()
+    set_target_properties(${profile_testname} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
     set(scaling_testname fmm_scaling_benchmark)
     add_executable(${scaling_testname} scaling_fmm_vs_bh.cu test_main.cpp)

@@ -26,6 +26,7 @@
 #include "cstone/cuda/cuda_utils.cuh"
 #include "cstone/cuda/device_vector.h"
 #include "cstone/cuda/gpu_config.cuh"
+#include "cstone/focus/source_center_gpu.h"
 #include "cstone/primitives/math.hpp"
 #include "cstone/primitives/warpscan.cuh"
 #include "cstone/sfc/box.hpp"
@@ -745,8 +746,10 @@ __global__ void fmmDualTraversalKernel(const TreeNodeIndex* __restrict__ childOf
     };
 
     auto p2p = [internalToLeaf, layout, x, y, z, h, m, ppot, pax, pay, paz,
-                firstTarget, d_p2pCount] __device__(TreeNodeIndex a, TreeNodeIndex b)
+                firstTarget, d_p2pCount] __device__(unsigned p2pMask, TreeNodeIndex a, TreeNodeIndex b)
     {
+        unsigned lane = threadIdx.x % cstone::GpuConfig::warpSize;
+        if (!((p2pMask >> lane) & 1u)) return;
         atomicAdd(d_p2pCount, 1u);
         TreeNodeIndex aLeaf = internalToLeaf[a];
         TreeNodeIndex bLeaf = internalToLeaf[b];
@@ -1042,6 +1045,243 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     cudaFree(d_z);
     cudaFree(d_h);
     cudaFree(d_m);
+
+    cudaFree(d_multipoles);
+    cudaFree(d_locals);
+
+    cudaFree(d_ppot);
+    cudaFree(d_pax);
+    cudaFree(d_pay);
+    cudaFree(d_paz);
+
+    cudaFree(d_gA);
+    cudaFree(d_gB);
+    cudaFree(d_gIsP2P);
+    cudaFree(d_wHead);
+    cudaFree(d_rHead);
+    cudaFree(d_segCount);
+    cudaFree(d_segR);
+    cudaFree(d_nProd);
+
+    cudaFree(d_tA);
+    cudaFree(d_tB);
+    cudaFree(d_twHead);
+    cudaFree(d_trHead);
+    cudaFree(d_tsegR);
+
+    cudaFree(d_m2lCount);
+    cudaFree(d_p2pCount);
+}
+
+// ---------------------------------------------------------------------------
+// Helper kernel for GPU-native spherical path
+// ---------------------------------------------------------------------------
+
+template<class T>
+__global__ void sphApplyGScalingKernel(LocalIndex n, float G,
+                                        const T* pax, const T* pay, const T* paz,
+                                        T* ax, T* ay, T* az)
+{
+    LocalIndex i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        ax[i] += T(G) * pax[i];
+        ay[i] += T(G) * pay[i];
+        az[i] += T(G) * paz[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-native overload — takes device pointers, no CPU upload/download
+// ---------------------------------------------------------------------------
+
+template<class T, class KeyType>
+void computeGravityFMMGpu(
+    const KeyType* d_prefixes, const TreeNodeIndex* d_childOffsets,
+    const TreeNodeIndex* d_internalToLeaf, const TreeNodeIndex* d_leafToInternal,
+    const LocalIndex* d_layout, const cstone::SourceCenterType<T>* d_centers,
+    std::span<const TreeNodeIndex> levelRange,
+    TreeNodeIndex numNodes, TreeNodeIndex numLeaves,
+    const T* d_x, const T* d_y, const T* d_z, const T* d_h, const T* d_m,
+    const cstone::Box<T>& box, float theta, float G,
+    T* d_ax, T* d_ay, T* d_az,
+    T* ugravTot, LocalIndex numParticles)
+{
+    T          invTheta    = T(1) / T(theta);
+    LocalIndex firstTarget = 0;
+    LocalIndex numTargets  = numParticles;
+
+    // 1. Upload SphericalTables
+    GpuSphericalTables tables = uploadSphericalTables();
+
+    // 2. Compute geometric centers/sizes on GPU from SFC prefixes
+    Vec3<T>* d_geoCenters;
+    Vec3<T>* d_geoSizes;
+    checkGpuErrors(cudaMalloc(&d_geoCenters, numNodes * sizeof(Vec3<T>)));
+    checkGpuErrors(cudaMalloc(&d_geoSizes, numNodes * sizeof(Vec3<T>)));
+    cstone::computeGeoCentersGpu(d_prefixes, numNodes, d_geoCenters, d_geoSizes, box);
+
+    // 3. Allocate device multipoles and compute P2M + M2M on GPU
+    GpuSphericalMultipole<T>* d_multipoles;
+    checkGpuErrors(cudaMalloc(&d_multipoles, numNodes * sizeof(GpuSphericalMultipole<T>)));
+    checkGpuErrors(cudaMemset(d_multipoles, 0, numNodes * sizeof(GpuSphericalMultipole<T>)));
+
+    computeLeafMultipolesGpu(d_x, d_y, d_z, d_m, d_leafToInternal, numLeaves, d_layout, d_centers, d_multipoles,
+                             tables);
+    upsweepMultipolesGpu(levelRange, d_childOffsets, d_centers, d_multipoles, tables);
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 4. Allocate + zero-init device locals and particle accumulators
+    GpuSphericalLocalExpansion<T>* d_locals;
+    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(GpuSphericalLocalExpansion<T>)));
+    checkGpuErrors(cudaMemset(d_locals, 0, numNodes * sizeof(GpuSphericalLocalExpansion<T>)));
+
+    T *d_ppot, *d_pax, *d_pay, *d_paz;
+    checkGpuErrors(cudaMalloc(&d_ppot, numTargets * sizeof(T)));
+    checkGpuErrors(cudaMalloc(&d_pax, numTargets * sizeof(T)));
+    checkGpuErrors(cudaMalloc(&d_pay, numTargets * sizeof(T)));
+    checkGpuErrors(cudaMalloc(&d_paz, numTargets * sizeof(T)));
+    checkGpuErrors(cudaMemset(d_ppot, 0, numTargets * sizeof(T)));
+    checkGpuErrors(cudaMemset(d_pax, 0, numTargets * sizeof(T)));
+    checkGpuErrors(cudaMemset(d_pay, 0, numTargets * sizeof(T)));
+    checkGpuErrors(cudaMemset(d_paz, 0, numTargets * sizeof(T)));
+
+    // 5. Allocate global work queues for dual traversal
+    constexpr unsigned gChunk = FmmTravConfig::chunkSize;
+    constexpr unsigned gSegs  = 2048;
+    constexpr unsigned gCap   = gSegs * gChunk;
+
+    TreeNodeIndex* d_gA;
+    TreeNodeIndex* d_gB;
+    int*           d_gIsP2P;
+    unsigned*      d_wHead;
+    unsigned*      d_rHead;
+    unsigned*      d_segCount;
+    unsigned*      d_segR;
+    unsigned*      d_nProd;
+
+    checkGpuErrors(cudaMalloc(&d_gA, gCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_gB, gCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_gIsP2P, gCap * sizeof(int)));
+    checkGpuErrors(cudaMalloc(&d_wHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_rHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_segCount, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_segR, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_nProd, sizeof(unsigned)));
+
+    cstone::GlobalWorkQueue gq{d_gA, d_gB, d_gIsP2P, d_wHead, d_rHead, d_segCount, d_segR, gSegs};
+
+    constexpr unsigned tChunk = FmmTravConfig::travChunkSize;
+    constexpr unsigned tSegs  = 2048;
+    constexpr unsigned tCap   = tSegs * tChunk;
+
+    TreeNodeIndex* d_tA;
+    TreeNodeIndex* d_tB;
+    unsigned*      d_twHead;
+    unsigned*      d_trHead;
+    unsigned*      d_tsegR;
+
+    checkGpuErrors(cudaMalloc(&d_tA, tCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_tB, tCap * sizeof(TreeNodeIndex)));
+    checkGpuErrors(cudaMalloc(&d_twHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_trHead, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_tsegR, tSegs * sizeof(unsigned)));
+
+    cstone::GlobalTraversalQueue tq{d_tA, d_tB, d_twHead, d_trHead, d_tsegR, tSegs};
+
+    // 6. Reset queues
+    checkGpuErrors(cudaMemset(d_wHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_rHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_segCount, 0, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_segR, 0, gSegs * sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_twHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_trHead, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_tsegR, 0, tSegs * sizeof(unsigned)));
+
+    // 7. Configure cluster launch
+    constexpr unsigned kBlocksPerCluster = FmmDualConfig::kBlocksPerCluster;
+    constexpr unsigned numWarps          = FmmDualConfig::numWarps;
+    constexpr unsigned threadsPerBlock   = FmmDualConfig::numThreadsPerBlock;
+
+    unsigned maxBlocks = cstone::maxConcurrentBlocks(
+        fmmDualTraversalKernel<numWarps, T>, threadsPerBlock, kBlocksPerCluster);
+    unsigned totalBlocks = maxBlocks;
+
+    cudaLaunchConfig_t    dualCfg{};
+    dualCfg.gridDim  = {totalBlocks, 1, 1};
+    dualCfg.blockDim = {threadsPerBlock, 1, 1};
+    cudaLaunchAttribute dualAttr{};
+    dualAttr.id               = cudaLaunchAttributeClusterDimension;
+    dualAttr.val.clusterDim.x = kBlocksPerCluster;
+    dualAttr.val.clusterDim.y = 1;
+    dualAttr.val.clusterDim.z = 1;
+    dualCfg.attrs    = &dualAttr;
+    dualCfg.numAttrs = 1;
+
+    checkGpuErrors(cudaMemset(d_nProd, 0, sizeof(unsigned)));
+
+    // 8. Allocate interaction counters
+    unsigned* d_m2lCount;
+    unsigned* d_p2pCount;
+    checkGpuErrors(cudaMalloc(&d_m2lCount, sizeof(unsigned)));
+    checkGpuErrors(cudaMalloc(&d_p2pCount, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_m2lCount, 0, sizeof(unsigned)));
+    checkGpuErrors(cudaMemset(d_p2pCount, 0, sizeof(unsigned)));
+
+    // 9. Launch dual traversal
+    checkGpuErrors(cudaLaunchKernelEx(&dualCfg, fmmDualTraversalKernel<numWarps, T>, d_childOffsets, d_geoCenters,
+                                      d_geoSizes, d_centers, d_multipoles, d_locals, d_internalToLeaf, d_layout, d_x,
+                                      d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz, firstTarget, invTheta, tables,
+                                      gq, tq, d_nProd, d_m2lCount, d_p2pCount));
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 10. L2L downsweep
+    downsweepLocalExpansionsGpu(levelRange, d_childOffsets, d_centers, d_locals, tables);
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 11. L2P
+    {
+        constexpr int numThreads = 256;
+        if (numLeaves > 0)
+        {
+            l2pKernel<<<(numLeaves + numThreads - 1) / numThreads, numThreads>>>(
+                0, numLeaves, d_leafToInternal, d_layout, d_centers, d_locals, d_x, d_y, d_z, d_ppot,
+                d_pax, d_pay, d_paz, firstTarget, tables);
+            checkGpuErrors(cudaDeviceSynchronize());
+        }
+    }
+
+    // 12. Apply G-scaling on GPU and accumulate into caller's output buffers
+    {
+        int nt = 256;
+        int nb = cstone::iceil(numTargets, nt);
+        if (nb)
+        {
+            sphApplyGScalingKernel<<<nb, nt>>>(numTargets, G, d_pax, d_pay, d_paz,
+                                               d_ax, d_ay, d_az);
+        }
+    }
+
+    // 13. Download potential sum for ugravTot (small scalar)
+    if (ugravTot)
+    {
+        std::vector<T> h_ppot(numTargets);
+        std::vector<T> h_m(numTargets);
+        checkGpuErrors(cudaMemcpy(h_ppot.data(), d_ppot, numTargets * sizeof(T), cudaMemcpyDeviceToHost));
+        checkGpuErrors(cudaMemcpy(h_m.data(), d_m, numTargets * sizeof(T), cudaMemcpyDeviceToHost));
+        T ugravLoc = 0;
+        for (LocalIndex i = 0; i < numTargets; ++i)
+            ugravLoc += G * h_m[i] * h_ppot[i];
+        *ugravTot += T(0.5) * ugravLoc;
+    }
+
+    checkGpuErrors(cudaDeviceSynchronize());
+
+    // 14. Free internally-allocated temporaries (caller owns input device pointers)
+    freeSphericalTables(tables);
+
+    cudaFree(d_geoCenters);
+    cudaFree(d_geoSizes);
 
     cudaFree(d_multipoles);
     cudaFree(d_locals);

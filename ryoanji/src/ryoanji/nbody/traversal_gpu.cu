@@ -580,10 +580,7 @@ double traverse(cstone::GroupView grp, const int initNodeIdx, const Tc* __restri
     float msTraverse;
     cudaEventElapsedTime(&msTraverse, evStart, evEnd);
 
-    auto stats = readBhStats();
-    printf("[Barnes-Hut GPU] Traversal: %.3f ms | blocks: %d\n", msTraverse, numBlocks);
-    printf("[Barnes-Hut GPU] sumP2P: %llu, maxP2P: %llu, sumM2P: %llu, maxM2P: %llu, maxStack: %llu\n",
-           stats[0], stats[1], stats[2], stats[3], stats[4]);
+    // Stats available via readBhStats()
 
     cudaEventDestroy(evStart);
     cudaEventDestroy(evEnd);
