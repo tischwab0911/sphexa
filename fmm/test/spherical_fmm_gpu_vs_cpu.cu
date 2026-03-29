@@ -33,7 +33,9 @@ using namespace cstone;
 
 TEST(SphericalFMM, GpuVsCpu)
 {
-    using T             = double;
+    using Tc            = double;
+    using Tm            = Tc;
+    using T             = Tc;
     using KeyType       = uint64_t;
     using MultipoleType = fmm::SphericalMultipole<T>;
 
@@ -85,11 +87,12 @@ TEST(SphericalFMM, GpuVsCpu)
     T              cpuEgrav = 0;
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    fmm::computeGravityFMM<T, KeyType>(octree.prefixes.data(), octree.childOffsets.data(),
+    fmm::computeGravityFMM<fmm::ScalarMac, T, KeyType>(
+                                        octree.prefixes.data(), octree.childOffsets.data(),
                                         octree.internalToLeaf.data(), toInternal,
                                         std::span<const TreeNodeIndex>(octree.levelRange), centers.data(),
                                         multipoles.data(), layout.data(), 0, octree.numLeafNodes, x, y, z, h,
-                                        masses.data(), box, theta, G, (T*)nullptr, cpuAx.data(), cpuAy.data(),
+                                        masses.data(), box, G, 1.0f / theta, (T*)nullptr, cpuAx.data(), cpuAy.data(),
                                         cpuAz.data(), &cpuEgrav);
     auto   t1         = std::chrono::high_resolution_clock::now();
     double cpuElapsed = std::chrono::duration<double>(t1 - t0).count();
@@ -103,11 +106,11 @@ TEST(SphericalFMM, GpuVsCpu)
     T              gpuEgrav = 0;
 
     t0 = std::chrono::high_resolution_clock::now();
-    fmm::computeGravityFMMGpu<T, KeyType>(
+    fmm::computeGravityFMMGpu<fmm::ScalarMac, T, KeyType>(
         octree.prefixes.data(), octree.childOffsets.data(), octree.internalToLeaf.data(), toInternal,
         std::span<const TreeNodeIndex>(octree.levelRange), centers.data(), multipoles.data(), layout.data(), 0,
-        octree.numLeafNodes, x, y, z, h, masses.data(), box, theta, G, (T*)nullptr, gpuAx.data(), gpuAy.data(),
-        gpuAz.data(), &gpuEgrav, numParticles);
+        octree.numLeafNodes, x, y, z, h, masses.data(), box, G, 1.0f / theta, (T*)nullptr, gpuAx.data(),
+        gpuAy.data(), gpuAz.data(), &gpuEgrav, numParticles);
     t1                 = std::chrono::high_resolution_clock::now();
     double gpuElapsed = std::chrono::duration<double>(t1 - t0).count();
     std::cout << "GPU FMM (P=" << fmm::ExpansionOrder << ") for " << numParticles << " particles: " << gpuElapsed

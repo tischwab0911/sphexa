@@ -8,10 +8,11 @@
  */
 
 /*! @file
- * @brief GPU port of spherical harmonic multipole FMM kernels
+ * @brief GPU orchestration for spherical harmonic FMM
  *
- * Uses thrust::complex<T> instead of std::complex<T> for device compatibility.
- * Memory layout is identical, so CPU-computed data can be cudaMemcpy'd directly.
+ * All computational kernels (P2M, M2M, M2L, L2L, L2P) are HOST_DEVICE_FUN
+ * and defined in spherical_multipole.hpp. This file provides GPU launch
+ * wrappers, table upload, and the dual-traversal kernel.
  */
 
 #pragma once
@@ -43,27 +44,14 @@ namespace fmm
 {
 
 // ---------------------------------------------------------------------------
-// GPU type aliases
-// ---------------------------------------------------------------------------
-
-template<class T>
-using GpuComplex = thrust::complex<T>;
-
-template<class T, int P = ExpansionOrder>
-using GpuSphericalMultipole = util::array<GpuComplex<T>, Nterm<P>>;
-
-template<class T, int P = ExpansionOrder>
-using GpuSphericalLocalExpansion = util::array<GpuComplex<T>, Nterm<P>>;
-
-// ---------------------------------------------------------------------------
 // GPU tables
 // ---------------------------------------------------------------------------
 
 struct GpuSphericalTables
 {
-    double*            prefactor; // [4*P*P] on device
-    double*            Anm;       // [4*P*P] on device
-    GpuComplex<double>* Cnm;      // [P*P*P*P] on device
+    double*          prefactor; // [4*P*P] on device
+    double*          Anm;       // [4*P*P] on device
+    Complex<double>* Cnm;       // [P*P*P*P] on device
 };
 
 inline GpuSphericalTables uploadSphericalTables()
@@ -77,12 +65,12 @@ inline GpuSphericalTables uploadSphericalTables()
     GpuSphericalTables gpu;
     checkGpuErrors(cudaMalloc(&gpu.prefactor, 4 * PP2 * sizeof(double)));
     checkGpuErrors(cudaMalloc(&gpu.Anm, 4 * PP2 * sizeof(double)));
-    checkGpuErrors(cudaMalloc(&gpu.Cnm, PP4 * sizeof(GpuComplex<double>)));
+    checkGpuErrors(cudaMalloc(&gpu.Cnm, PP4 * sizeof(Complex<double>)));
 
     checkGpuErrors(cudaMemcpy(gpu.prefactor, tab.prefactor.data(), 4 * PP2 * sizeof(double), cudaMemcpyHostToDevice));
     checkGpuErrors(cudaMemcpy(gpu.Anm, tab.Anm.data(), 4 * PP2 * sizeof(double), cudaMemcpyHostToDevice));
     // std::complex<double> and thrust::complex<double> have identical layout
-    checkGpuErrors(cudaMemcpy(gpu.Cnm, tab.Cnm.data(), PP4 * sizeof(GpuComplex<double>), cudaMemcpyHostToDevice));
+    checkGpuErrors(cudaMemcpy(gpu.Cnm, tab.Cnm.data(), PP4 * sizeof(Complex<double>), cudaMemcpyHostToDevice));
 
     return gpu;
 }
@@ -98,412 +86,6 @@ inline void freeSphericalTables(GpuSphericalTables& gpu)
 }
 
 // ---------------------------------------------------------------------------
-// Device helpers
-// ---------------------------------------------------------------------------
-
-__device__ __host__ constexpr int oddevenGpu(int n) { return (n & 1) ? -1 : 1; }
-
-template<class T>
-__device__ void atomicAddComplex(GpuComplex<T>* addr, GpuComplex<T> val)
-{
-    atomicAdd(reinterpret_cast<T*>(addr), val.real());
-    atomicAdd(reinterpret_cast<T*>(addr) + 1, val.imag());
-}
-
-// ---------------------------------------------------------------------------
-// Device coordinate conversions
-// ---------------------------------------------------------------------------
-
-template<class T>
-__device__ void cart2sphGpu(T& r, T& theta, T& phi, Vec3<T> dist)
-{
-    constexpr T EPS = T(1e-6);
-    r               = sqrt(norm2(dist)) + EPS;
-    theta           = acos(dist[2] / r);
-    T absx          = abs(dist[0]);
-    T absy          = abs(dist[1]);
-    if (absx + absy < EPS) { phi = 0; }
-    else if (absx < EPS) { phi = dist[1] / absy * T(M_PI) * T(0.5); }
-    else if (dist[0] > 0) { phi = atan(dist[1] / dist[0]); }
-    else { phi = atan(dist[1] / dist[0]) + T(M_PI); }
-}
-
-template<class T>
-__device__ Vec3<T> sph2cartGpu(T r, T theta, T phi, Vec3<T> spherical)
-{
-    T st = sin(theta);
-    T ct = cos(theta);
-    T sp = sin(phi);
-    T cp = cos(phi);
-
-    return {st * cp * spherical[0] + ct * cp / r * spherical[1] - sp / r / st * spherical[2],
-            st * sp * spherical[0] + ct * sp / r * spherical[1] + cp / r / st * spherical[2],
-            ct * spherical[0] - st / r * spherical[1]};
-}
-
-// ---------------------------------------------------------------------------
-// Solid harmonics evaluation (device)
-// ---------------------------------------------------------------------------
-
-template<int P, class T>
-__device__ void evalMultipoleGpu(GpuComplex<T>* Ynm, GpuComplex<T>* YnmTheta, const double* prefactor, T rho, T alpha,
-                                 T beta)
-{
-    const GpuComplex<T> I(0, 1);
-    T                   x    = cos(alpha);
-    T                   y    = sin(alpha);
-    T                   fact = 1;
-    T                   pn   = 1;
-    T                   rhom = 1;
-
-    for (int m = 0; m != P; ++m)
-    {
-        GpuComplex<T> eim = thrust::exp(I * T(m * beta));
-        T             p   = pn;
-        int           npn = m * m + 2 * m;
-        int           nmn = m * m;
-
-        Ynm[npn] = rhom * p * T(prefactor[npn]) * eim;
-        Ynm[nmn] = thrust::conj(Ynm[npn]);
-
-        T p1 = p;
-        p    = x * (2 * m + 1) * p1;
-
-        YnmTheta[npn] = rhom * (p - (m + 1) * x * p1) / y * T(prefactor[npn]) * eim;
-
-        rhom *= rho;
-        T rhon = rhom;
-
-        for (int n = m + 1; n != P; ++n)
-        {
-            int npm = n * n + n + m;
-            int nmm = n * n + n - m;
-
-            Ynm[npm] = rhon * p * T(prefactor[npm]) * eim;
-            Ynm[nmm] = thrust::conj(Ynm[npm]);
-
-            T p2 = p1;
-            p1   = p;
-            p    = (x * (2 * n + 1) * p1 - (n + m) * p2) / (n - m + 1);
-
-            YnmTheta[npm] = rhon * ((n - m + 1) * p - (n + 1) * x * p1) / y * T(prefactor[npm]) * eim;
-            rhon *= rho;
-        }
-
-        pn = -pn * fact * y;
-        fact += 2;
-    }
-}
-
-template<int P, class T>
-__device__ void evalLocalGpu(GpuComplex<T>* Ynm, GpuComplex<T>* YnmTheta, const double* prefactor, T rho, T alpha,
-                             T beta)
-{
-    const GpuComplex<T> I(0, 1);
-    T                   x    = cos(alpha);
-    T                   y    = sin(alpha);
-    T                   fact = 1;
-    T                   pn   = 1;
-    T                   rhom = T(1) / rho;
-
-    for (int m = 0; m != 2 * P; ++m)
-    {
-        GpuComplex<T> eim = thrust::exp(I * T(m * beta));
-        T             p   = pn;
-        int           npn = m * m + 2 * m;
-        int           nmn = m * m;
-
-        Ynm[npn] = rhom * p * T(prefactor[npn]) * eim;
-        Ynm[nmn] = thrust::conj(Ynm[npn]);
-
-        T p1 = p;
-        p    = x * (2 * m + 1) * p1;
-
-        YnmTheta[npn] = rhom * (p - (m + 1) * x * p1) / y * T(prefactor[npn]) * eim;
-
-        rhom /= rho;
-        T rhon = rhom;
-
-        for (int n = m + 1; n != 2 * P; ++n)
-        {
-            int npm = n * n + n + m;
-            int nmm = n * n + n - m;
-
-            Ynm[npm] = rhon * p * T(prefactor[npm]) * eim;
-            Ynm[nmm] = thrust::conj(Ynm[npm]);
-
-            T p2 = p1;
-            p1   = p;
-            p    = (x * (2 * n + 1) * p1 - (n + m) * p2) / (n - m + 1);
-
-            YnmTheta[npm] = rhon * ((n - m + 1) * p - (n + 1) * x * p1) / y * T(prefactor[npm]) * eim;
-            rhon /= rho;
-        }
-
-        pn = -pn * fact * y;
-        fact += 2;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// P2M — Particle to Multipole (device, with stride for warp-parallel reduction)
-// ---------------------------------------------------------------------------
-
-template<int stride = 1, class T1, class T2>
-__device__ void P2MGpu(const T1* x, const T1* y, const T1* z, const T2* m, LocalIndex begin, LocalIndex end,
-                       const Vec4<T1>& center, GpuSphericalMultipole<T1>& multipole, const double* prefactor)
-{
-    constexpr int PP = ExpansionOrder;
-
-    GpuComplex<T1> Ynm_buf[4 * PP * PP];
-    GpuComplex<T1> YnmTheta_buf[4 * PP * PP];
-
-    for (auto& v : multipole)
-        v = GpuComplex<T1>(0, 0);
-
-    for (LocalIndex i = begin; i < end; i += stride)
-    {
-        Vec3<T1> dist{x[i] - center[0], y[i] - center[1], z[i] - center[2]};
-        T1       rho, alpha, beta;
-        cart2sphGpu(rho, alpha, beta, dist);
-        evalMultipoleGpu<PP>(Ynm_buf, YnmTheta_buf, prefactor, rho, alpha, -beta);
-
-        for (int n = 0; n < PP; ++n)
-        {
-            for (int k = 0; k <= n; ++k)
-            {
-                int nm  = n * n + n + k;
-                int nms = n * (n + 1) / 2 + k;
-                multipole[nms] += T1(m[i]) * Ynm_buf[nm];
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// M2M — Multipole to Multipole (device, single child contribution)
-// ---------------------------------------------------------------------------
-
-template<class T, class Tm>
-__device__ void M2MGpu(const Vec4<T>& Xout, const Vec4<T>& Xchild, const GpuSphericalMultipole<Tm>& Mchild,
-                       GpuSphericalMultipole<Tm>& Mout, const double* prefactor, const double* Anm)
-{
-    constexpr int       PP = ExpansionOrder;
-    const GpuComplex<Tm> I(0, 1);
-
-    GpuComplex<Tm> Ynm_buf[4 * PP * PP];
-    GpuComplex<Tm> YnmTheta_buf[4 * PP * PP];
-
-    Vec3<T> dist{Xout[0] - Xchild[0], Xout[1] - Xchild[1], Xout[2] - Xchild[2]};
-    T       rho, alpha, beta;
-    cart2sphGpu(rho, alpha, beta, dist);
-    evalMultipoleGpu<PP>(Ynm_buf, YnmTheta_buf, prefactor, Tm(rho), Tm(alpha), -Tm(beta));
-
-    for (int j = 0; j < PP; ++j)
-    {
-        for (int k = 0; k <= j; ++k)
-        {
-            int            jk  = j * j + j + k;
-            int            jks = j * (j + 1) / 2 + k;
-            GpuComplex<Tm> M(0, 0);
-
-            for (int n = 0; n <= j; ++n)
-            {
-                for (int m = -n; m <= min(k - 1, n); ++m)
-                {
-                    if (j - n >= k - m)
-                    {
-                        int jnkm  = (j - n) * (j - n) + j - n + k - m;
-                        int jnkms = (j - n) * (j - n + 1) / 2 + k - m;
-                        int nm    = n * n + n + m;
-                        int absm  = m < 0 ? -m : m;
-                        M += Mchild[jnkms] * thrust::pow(I, Tm(m - absm)) * Ynm_buf[nm] *
-                             Tm(oddevenGpu(n) * Anm[nm] * Anm[jnkm] / Anm[jk]);
-                    }
-                }
-                for (int m = k; m <= n; ++m)
-                {
-                    if (j - n >= m - k)
-                    {
-                        int jnkm  = (j - n) * (j - n) + j - n + k - m;
-                        int jnkms = (j - n) * (j - n + 1) / 2 - k + m;
-                        int nm    = n * n + n + m;
-                        M += thrust::conj(Mchild[jnkms]) * Ynm_buf[nm] *
-                             Tm(oddevenGpu(k + n + m) * Anm[nm] * Anm[jnkm] / Anm[jk]);
-                    }
-                }
-            }
-
-            Mout[jks] += M;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// M2L — Multipole to Local (device, with atomic accumulation)
-// ---------------------------------------------------------------------------
-
-template<class T>
-__device__ void M2LGpu(const Vec3<T>& targetCenter, const Vec3<T>& sourceCenter,
-                       const GpuSphericalMultipole<T>& multipole, GpuSphericalLocalExpansion<T>* local,
-                       const double* prefactor, const double* Anm, const GpuComplex<double>* Cnm)
-{
-    constexpr int PP  = ExpansionOrder;
-    constexpr int PP2 = PP * PP;
-
-    GpuComplex<T> Ynm_buf[4 * PP * PP];
-    GpuComplex<T> YnmTheta_buf[4 * PP * PP];
-
-    Vec3<T> dist{targetCenter[0] - sourceCenter[0], targetCenter[1] - sourceCenter[1],
-                 targetCenter[2] - sourceCenter[2]};
-    T       rho, alpha, beta;
-    cart2sphGpu(rho, alpha, beta, dist);
-    evalLocalGpu<PP>(Ynm_buf, YnmTheta_buf, prefactor, rho, alpha, beta);
-
-    for (int j = 0; j < PP; ++j)
-    {
-        for (int k = 0; k <= j; ++k)
-        {
-            int           jk  = j * j + j + k;
-            int           jks = j * (j + 1) / 2 + k;
-            GpuComplex<T> L(0, 0);
-
-            for (int n = 0; n < PP; ++n)
-            {
-                for (int m = -n; m < 0; ++m)
-                {
-                    int nm   = n * n + n + m;
-                    int nms  = n * (n + 1) / 2 - m;
-                    int jknm = jk * PP2 + nm;
-                    int jnkm = (j + n) * (j + n) + j + n + m - k;
-                    L += thrust::conj(GpuComplex<T>(multipole[nms])) * GpuComplex<T>(Cnm[jknm]) * Ynm_buf[jnkm];
-                }
-                for (int m = 0; m <= n; ++m)
-                {
-                    int nm   = n * n + n + m;
-                    int nms  = n * (n + 1) / 2 + m;
-                    int jknm = jk * PP2 + nm;
-                    int jnkm = (j + n) * (j + n) + j + n + m - k;
-                    L += GpuComplex<T>(multipole[nms]) * GpuComplex<T>(Cnm[jknm]) * Ynm_buf[jnkm];
-                }
-            }
-            atomicAddComplex(&((*local)[jks]), L);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// L2L — Local to Local (device, single child)
-// ---------------------------------------------------------------------------
-
-template<class T, class Tm>
-__device__ void L2LGpu(const Vec4<T>& Xparent, const Vec4<T>& Xchild,
-                       const GpuSphericalLocalExpansion<Tm>& Lparent, GpuSphericalLocalExpansion<Tm>& Lchild,
-                       const double* prefactor, const double* Anm)
-{
-    constexpr int          PP = ExpansionOrder;
-    const GpuComplex<Tm>   I(0, 1);
-
-    GpuComplex<Tm> Ynm_buf[4 * PP * PP];
-    GpuComplex<Tm> YnmTheta_buf[4 * PP * PP];
-
-    Vec3<T> dist{Xchild[0] - Xparent[0], Xchild[1] - Xparent[1], Xchild[2] - Xparent[2]};
-    T       rho, alpha, beta;
-    cart2sphGpu(rho, alpha, beta, dist);
-    evalMultipoleGpu<PP>(Ynm_buf, YnmTheta_buf, prefactor, Tm(rho), Tm(alpha), Tm(beta));
-
-    for (int j = 0; j < PP; ++j)
-    {
-        for (int k = 0; k <= j; ++k)
-        {
-            int            jk  = j * j + j + k;
-            int            jks = j * (j + 1) / 2 + k;
-            GpuComplex<Tm> L(0, 0);
-
-            for (int n = j; n < PP; ++n)
-            {
-                for (int m = j + k - n; m < 0; ++m)
-                {
-                    int absm_k = m - k;
-                    if (absm_k < 0) absm_k = -absm_k;
-                    if (n - j >= absm_k)
-                    {
-                        int jnkm = (n - j) * (n - j) + n - j + m - k;
-                        int nm   = n * n + n - m;
-                        int nms  = n * (n + 1) / 2 - m;
-                        L += thrust::conj(Lparent[nms]) * Ynm_buf[jnkm] *
-                             Tm(oddevenGpu(k) * Anm[jnkm] * Anm[jk] / Anm[nm]);
-                    }
-                }
-                for (int m = 0; m <= n; ++m)
-                {
-                    int absm_k = m - k;
-                    if (absm_k < 0) absm_k = -absm_k;
-                    if (n - j >= absm_k)
-                    {
-                        int jnkm = (n - j) * (n - j) + n - j + m - k;
-                        int nm   = n * n + n + m;
-                        int nms  = n * (n + 1) / 2 + m;
-                        int diff = m - k;
-                        int absd = diff < 0 ? -diff : diff;
-                        L += Lparent[nms] * thrust::pow(I, Tm(diff - absd)) * Ynm_buf[jnkm] *
-                             Tm(Anm[jnkm] * Anm[jk] / Anm[nm]);
-                    }
-                }
-            }
-            Lchild[jks] += L;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// L2P — Local to Particle (device)
-// ---------------------------------------------------------------------------
-
-template<class Ta, class Tc, class Tm>
-__device__ Vec4<Ta> L2PGpu(Vec4<Ta> acc, const Vec3<Tc>& target, const Vec3<Tc>& center,
-                           const GpuSphericalLocalExpansion<Tm>& local, const double* prefactor)
-{
-    constexpr int        PP = ExpansionOrder;
-    const GpuComplex<Ta> I(0, 1);
-
-    GpuComplex<Ta> Ynm_buf[4 * PP * PP];
-    GpuComplex<Ta> YnmTheta_buf[4 * PP * PP];
-
-    Vec3<Tc> dist{target[0] - center[0], target[1] - center[1], target[2] - center[2]};
-    Ta       r, theta, phi;
-    cart2sphGpu(r, theta, phi, dist);
-    evalMultipoleGpu<PP>(Ynm_buf, YnmTheta_buf, prefactor, r, theta, phi);
-
-    Ta       potential = 0;
-    Vec3<Ta> spherical{0, 0, 0};
-
-    for (int n = 0; n < PP; ++n)
-    {
-        int nm  = n * n + n;
-        int nms = n * (n + 1) / 2;
-
-        potential += (GpuComplex<Ta>(local[nms]) * Ynm_buf[nm]).real();
-        spherical[0] += (GpuComplex<Ta>(local[nms]) * Ynm_buf[nm]).real() / r * n;
-        spherical[1] += (GpuComplex<Ta>(local[nms]) * YnmTheta_buf[nm]).real();
-
-        for (int m = 1; m <= n; ++m)
-        {
-            nm  = n * n + n + m;
-            nms = n * (n + 1) / 2 + m;
-
-            potential += Ta(2) * (GpuComplex<Ta>(local[nms]) * Ynm_buf[nm]).real();
-            spherical[0] += Ta(2) * (GpuComplex<Ta>(local[nms]) * Ynm_buf[nm]).real() / r * n;
-            spherical[1] += Ta(2) * (GpuComplex<Ta>(local[nms]) * YnmTheta_buf[nm]).real();
-            spherical[2] += Ta(2) * (GpuComplex<Ta>(local[nms]) * Ynm_buf[nm] * I).real() * m;
-        }
-    }
-
-    Vec3<Ta> cartesian = sph2cartGpu(r, theta, phi, spherical);
-    return acc + Vec4<Ta>{-potential, cartesian[0], cartesian[1], cartesian[2]};
-}
-
-// ---------------------------------------------------------------------------
 // P2M kernel — compute leaf multipoles on GPU
 // ---------------------------------------------------------------------------
 
@@ -511,22 +93,22 @@ template<int TPL, class T>
 __global__ void computeLeafMultipolesGpuKernel(const T* x, const T* y, const T* z, const T* m,
                                                 const TreeNodeIndex* leafToInternal, TreeNodeIndex numLeaves,
                                                 const LocalIndex* layout, const Vec4<T>* centers,
-                                                GpuSphericalMultipole<T>* multipoles, GpuSphericalTables tables)
+                                                SphericalMultipole<T>* multipoles, GpuSphericalTables tables)
 {
     TreeNodeIndex tid     = blockIdx.x * blockDim.x + threadIdx.x;
     TreeNodeIndex leafIdx = tid / TPL;
     TreeNodeIndex internalIdx;
 
-    GpuSphericalMultipole<T> mp_loc;
+    SphericalMultipole<T> mp_loc;
     for (auto& v : mp_loc)
-        v = GpuComplex<T>(0, 0);
+        v = Complex<T>(0, 0);
 
     if (leafIdx < numLeaves)
     {
         internalIdx = leafToInternal[leafIdx];
         auto com    = centers[internalIdx];
-        P2MGpu<TPL>(x, y, z, m, layout[leafIdx] + threadIdx.x % TPL, layout[leafIdx + 1], com, mp_loc,
-                    tables.prefactor);
+        P2M<TPL>(x, y, z, m, layout[leafIdx] + threadIdx.x % TPL, layout[leafIdx + 1], com, mp_loc,
+                 tables.prefactor);
     }
 
     // Warp-level reduction across TPL threads
@@ -546,7 +128,7 @@ template<class T>
 void computeLeafMultipolesGpu(const T* d_x, const T* d_y, const T* d_z, const T* d_m,
                                const TreeNodeIndex* d_leafToInternal, TreeNodeIndex numLeaves,
                                const LocalIndex* d_layout, const Vec4<T>* d_centers,
-                               GpuSphericalMultipole<T>* d_multipoles, const GpuSphericalTables& tables)
+                               SphericalMultipole<T>* d_multipoles, const GpuSphericalTables& tables)
 {
     constexpr int numThreads    = 256;
     constexpr int threadsPerLeaf = 8;
@@ -567,7 +149,7 @@ void computeLeafMultipolesGpu(const T* d_x, const T* d_y, const T* d_z, const T*
 template<class T>
 __global__ void upsweepMultipolesGpuKernel(TreeNodeIndex firstCell, TreeNodeIndex lastCell,
                                             const TreeNodeIndex* childOffsets, const Vec4<T>* centers,
-                                            GpuSphericalMultipole<T>* multipoles, GpuSphericalTables tables)
+                                            SphericalMultipole<T>* multipoles, GpuSphericalTables tables)
 {
     TreeNodeIndex tid     = blockIdx.x * blockDim.x + threadIdx.x;
     const int     cellIdx = tid / 8 + firstCell;
@@ -575,14 +157,14 @@ __global__ void upsweepMultipolesGpuKernel(TreeNodeIndex firstCell, TreeNodeInde
     TreeNodeIndex firstChild = 0;
     if (cellIdx < lastCell) { firstChild = childOffsets[cellIdx]; }
 
-    GpuSphericalMultipole<T> Mout;
+    SphericalMultipole<T> Mout;
     for (auto& v : Mout)
-        v = GpuComplex<T>(0, 0);
+        v = Complex<T>(0, 0);
 
     if (firstChild)
     {
         int child = firstChild + threadIdx.x % 8;
-        M2MGpu(centers[cellIdx], centers[child], multipoles[child], Mout, tables.prefactor, tables.Anm);
+        M2M(centers[cellIdx], centers[child], multipoles[child], Mout, tables.prefactor, tables.Anm);
     }
 
     constexpr int mpNumElements = Nterm<ExpansionOrder>;
@@ -599,7 +181,7 @@ __global__ void upsweepMultipolesGpuKernel(TreeNodeIndex firstCell, TreeNodeInde
 
 template<class T>
 void upsweepMultipolesGpu(std::span<const TreeNodeIndex> levelRange, const TreeNodeIndex* d_childOffsets,
-                           const Vec4<T>* d_centers, GpuSphericalMultipole<T>* d_multipoles,
+                           const Vec4<T>* d_centers, SphericalMultipole<T>* d_multipoles,
                            const GpuSphericalTables& tables)
 {
     constexpr int numThreads = 256;
@@ -623,7 +205,7 @@ void upsweepMultipolesGpu(std::span<const TreeNodeIndex> levelRange, const TreeN
 
 template<class T>
 __global__ void l2lKernel(TreeNodeIndex start, TreeNodeIndex end, const TreeNodeIndex* childOffsets,
-                          const Vec4<T>* centers, GpuSphericalLocalExpansion<T>* locals, GpuSphericalTables tables)
+                          const Vec4<T>* centers, SphericalLocalExpansion<T>* locals, GpuSphericalTables tables)
 {
     TreeNodeIndex i = blockIdx.x * blockDim.x + threadIdx.x + start;
     if (i >= end) return;
@@ -633,13 +215,13 @@ __global__ void l2lKernel(TreeNodeIndex start, TreeNodeIndex end, const TreeNode
 
     for (int c = firstChild; c < firstChild + 8; ++c)
     {
-        L2LGpu(centers[i], centers[c], locals[i], locals[c], tables.prefactor, tables.Anm);
+        L2L(centers[i], centers[c], locals[i], locals[c], tables.prefactor, tables.Anm);
     }
 }
 
 template<class T>
 void downsweepLocalExpansionsGpu(std::span<const TreeNodeIndex> levelRange, const TreeNodeIndex* d_childOffsets,
-                                  const Vec4<T>* d_centers, GpuSphericalLocalExpansion<T>* d_locals,
+                                  const Vec4<T>* d_centers, SphericalLocalExpansion<T>* d_locals,
                                   const GpuSphericalTables& tables)
 {
     constexpr int numThreads = 256;
@@ -665,7 +247,7 @@ void downsweepLocalExpansionsGpu(std::span<const TreeNodeIndex> levelRange, cons
 template<class T>
 __global__ void l2pKernel(TreeNodeIndex firstLeaf, TreeNodeIndex lastLeaf, const TreeNodeIndex* leafToInternalMap,
                           const LocalIndex* layout, const Vec4<T>* centers,
-                          const GpuSphericalLocalExpansion<T>* locals, const T* x, const T* y, const T* z,
+                          const SphericalLocalExpansion<T>* locals, const T* x, const T* y, const T* z,
                           T* ppot, T* pax, T* pay, T* paz, LocalIndex firstTarget, GpuSphericalTables tables)
 {
     TreeNodeIndex leafIdx = blockIdx.x * blockDim.x + threadIdx.x + firstLeaf;
@@ -682,7 +264,7 @@ __global__ void l2pKernel(TreeNodeIndex firstLeaf, TreeNodeIndex lastLeaf, const
         LocalIndex ti = t - firstTarget;
         Vec4<T>    acc{ppot[ti], pax[ti], pay[ti], paz[ti]};
         Vec3<T>    target{x[t], y[t], z[t]};
-        acc      = L2PGpu(acc, target, center, L, tables.prefactor);
+        acc      = L2P(acc, target, center, L, tables.prefactor);
         ppot[ti] = acc[0];
         pax[ti]  = acc[1];
         pay[ti]  = acc[2];
@@ -703,54 +285,60 @@ struct FmmDualConfig
     static constexpr unsigned kBlocksPerCluster = 8;
 };
 
-template<int numWarps, class T>
+template<MacVariant macType, int numWarps, class T>
 __global__ void fmmDualTraversalKernel(const TreeNodeIndex* __restrict__ childOffsets,
                                        const Vec3<T>* __restrict__ geoCenters,
                                        const Vec3<T>* __restrict__ geoSizes,
                                        const Vec4<T>* __restrict__ centers,
-                                       const GpuSphericalMultipole<T>* __restrict__ multipoles,
-                                       GpuSphericalLocalExpansion<T>* __restrict__ locals,
+                                       const SphericalMultipole<T>* __restrict__ multipoles,
+                                       SphericalLocalExpansion<T>* __restrict__ locals,
                                        const TreeNodeIndex* __restrict__ internalToLeaf,
                                        const LocalIndex* __restrict__ layout,
                                        const T* __restrict__ x, const T* __restrict__ y,
                                        const T* __restrict__ z, const T* __restrict__ h, const T* __restrict__ m,
                                        T* __restrict__ ppot, T* __restrict__ pax, T* __restrict__ pay,
                                        T* __restrict__ paz, LocalIndex firstTarget,
-                                       T invTheta, GpuSphericalTables tables,
+                                       GpuSphericalTables tables,
                                        cstone::GlobalWorkQueue gq, cstone::GlobalTraversalQueue tq,
-                                       unsigned* nProd,
-                                       unsigned* d_m2lCount, unsigned* d_p2pCount)
+                                       unsigned* nProd)
 {
-    auto continuation = [geoCenters, geoSizes, invTheta] __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
+    auto continuation = [centers, geoCenters, geoSizes]
+        __device__(TreeNodeIndex a, TreeNodeIndex b) -> bool
     {
-        Vec3<T> centerA = geoCenters[a];
-        Vec3<T> sizeA   = geoSizes[a];
-        Vec3<T> centerB = geoCenters[b];
-        Vec3<T> sizeB   = geoSizes[b];
-
-        Vec3<T> d     = cstone::minDistance(centerA, sizeA, centerB, sizeB);
-        T       dist2 = norm2(d);
-
-        T lA        = T(2) * max(max(sizeA[0], sizeA[1]), sizeA[2]);
-        T lB        = T(2) * max(max(sizeB[0], sizeB[1]), sizeB[2]);
-        T threshold = max(lA, lB) * invTheta;
-
-        return dist2 < threshold * threshold;
+        if constexpr (macType == DirectionalMac)
+        {
+            return cstone::evaluateMacM2L(
+                util::makeVec3(centers[a]), centers[a][3],
+                util::makeVec3(centers[b]), centers[b][3]);
+        }
+        else
+        {
+            return cstone::evaluateMac(util::makeVec3(centers[a]), centers[a][3],
+                                        geoCenters[b], geoSizes[b]);
+        }
     };
 
-    auto m2l = [centers, multipoles, locals, tables, d_m2lCount] __device__(TreeNodeIndex a, TreeNodeIndex b)
+    auto m2l = [centers, multipoles, locals, tables] __device__(TreeNodeIndex a, TreeNodeIndex b)
     {
-        atomicAdd(d_m2lCount, 1u);
-        M2LGpu(util::makeVec3(centers[a]), util::makeVec3(centers[b]), multipoles[b], &locals[a], tables.prefactor,
-               tables.Anm, tables.Cnm);
+        // Compute M2L into thread-local buffer, then atomic-add into shared local expansion
+        SphericalLocalExpansion<T> localBuf;
+        for (auto& v : localBuf)
+            v = Complex<T>(0, 0);
+        M2L(util::makeVec3(centers[a]), util::makeVec3(centers[b]), multipoles[b], localBuf, tables.prefactor,
+            tables.Anm, tables.Cnm);
+        for (int i = 0; i < Nterm<ExpansionOrder>; ++i)
+        {
+            atomicAdd(reinterpret_cast<T*>(&locals[a][i]), localBuf[i].real());
+            atomicAdd(reinterpret_cast<T*>(&locals[a][i]) + 1, localBuf[i].imag());
+        }
     };
 
     auto p2p = [internalToLeaf, layout, x, y, z, h, m, ppot, pax, pay, paz,
-                firstTarget, d_p2pCount] __device__(unsigned p2pMask, TreeNodeIndex a, TreeNodeIndex b)
+                firstTarget] __device__(unsigned p2pMask, TreeNodeIndex a, TreeNodeIndex b)
     {
         unsigned lane = threadIdx.x % cstone::GpuConfig::warpSize;
         if (!((p2pMask >> lane) & 1u)) return;
-        atomicAdd(d_p2pCount, 1u);
+
         TreeNodeIndex aLeaf = internalToLeaf[a];
         TreeNodeIndex bLeaf = internalToLeaf[b];
 
@@ -780,22 +368,21 @@ __global__ void fmmDualTraversalKernel(const TreeNodeIndex* __restrict__ childOf
 }
 
 // ---------------------------------------------------------------------------
-// Host orchestration
+// Host orchestration — host-pointer overload
 // ---------------------------------------------------------------------------
 
-template<class T, class KeyType>
+template<MacVariant macType = ScalarMac, class T, class KeyType>
 void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOffsets,
                            const TreeNodeIndex* internalToLeaf,
                            std::span<const TreeNodeIndex> leafToInternalMap,
                            std::span<const TreeNodeIndex> levelRange, const cstone::SourceCenterType<T>* centers,
-                           const SphericalMultipole<T>* multipoles, const LocalIndex* layout,
+                           const SphericalMultipole<T>* /*multipoles*/, const LocalIndex* layout,
                            TreeNodeIndex firstLeafIndex, TreeNodeIndex lastLeafIndex, const T* x, const T* y,
-                           const T* z, const T* h, const T* m, const cstone::Box<T>& box, float theta, float G,
-                           T* ugrav, T* ax, T* ay, T* az, T* ugravTot, LocalIndex numParticles)
+                           const T* z, const T* h, const T* m, const cstone::Box<T>& box, float G,
+                           float invTheta, T* ugrav, T* ax, T* ay, T* az, T* ugravTot, LocalIndex numParticles)
 {
     TreeNodeIndex numNodes     = levelRange.back();
     TreeNodeIndex numLeaves    = TreeNodeIndex(leafToInternalMap.size());
-    T             invTheta     = T(1) / T(theta);
     LocalIndex    firstTarget  = layout[firstLeafIndex];
     LocalIndex    lastTarget   = layout[lastLeafIndex];
     LocalIndex    numTargets   = lastTarget - firstTarget;
@@ -814,7 +401,7 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
         auto     nodeBox  = cstone::sfcIBox(cstone::sfcKey(startKey), level);
         auto [center, sz] = cstone::centerAndSize<KeyType>(nodeBox, box);
         h_geoCenters[i]   = center;
-        h_geoSizes[i]     = sz;
+        h_geoSizes[i]     = sz * T(invTheta);
     }
 
     // 3. Upload tree structure arrays
@@ -861,9 +448,9 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     checkGpuErrors(cudaMemcpy(d_m, m, numParticles * sizeof(T), cudaMemcpyHostToDevice));
 
     // 5. Allocate device multipoles and compute P2M + M2M on GPU
-    GpuSphericalMultipole<T>* d_multipoles;
-    checkGpuErrors(cudaMalloc(&d_multipoles, numNodes * sizeof(GpuSphericalMultipole<T>)));
-    checkGpuErrors(cudaMemset(d_multipoles, 0, numNodes * sizeof(GpuSphericalMultipole<T>)));
+    SphericalMultipole<T>* d_multipoles;
+    checkGpuErrors(cudaMalloc(&d_multipoles, numNodes * sizeof(SphericalMultipole<T>)));
+    checkGpuErrors(cudaMemset(d_multipoles, 0, numNodes * sizeof(SphericalMultipole<T>)));
 
     computeLeafMultipolesGpu(d_x, d_y, d_z, d_m, d_leafToInternal, numLeaves, d_layout, d_centers, d_multipoles,
                              tables);
@@ -872,9 +459,9 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     checkGpuErrors(cudaDeviceSynchronize());
 
     // 6. Allocate + zero-init device locals and particle accumulators
-    GpuSphericalLocalExpansion<T>* d_locals;
-    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(GpuSphericalLocalExpansion<T>)));
-    checkGpuErrors(cudaMemset(d_locals, 0, numNodes * sizeof(GpuSphericalLocalExpansion<T>)));
+    SphericalLocalExpansion<T>* d_locals;
+    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(SphericalLocalExpansion<T>)));
+    checkGpuErrors(cudaMemset(d_locals, 0, numNodes * sizeof(SphericalLocalExpansion<T>)));
 
     T *d_ppot, *d_pax, *d_pay, *d_paz;
     checkGpuErrors(cudaMalloc(&d_ppot, numTargets * sizeof(T)));
@@ -943,15 +530,8 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     constexpr unsigned numWarps          = FmmDualConfig::numWarps;
     constexpr unsigned threadsPerBlock   = FmmDualConfig::numThreadsPerBlock;
 
-    // Query max co-resident blocks to avoid occupancy deadlock.
-    // All launched blocks must be schedulable concurrently so every block
-    // decrements numActiveProducers and the kernel can terminate.
-    // Future (Blackwell sm_100+): Use Cluster Launch Control with try_cancel
-    // to over-subscribe the grid and dynamically steal work from unscheduled
-    // clusters, eliminating the need for conservative grid sizing.
-    // See cudaLaunchAttributeClusterSchedulingPolicyPreference / cudaTryCancel.
     unsigned maxBlocks = cstone::maxConcurrentBlocks(
-        fmmDualTraversalKernel<numWarps, T>, threadsPerBlock, kBlocksPerCluster);
+        fmmDualTraversalKernel<macType, numWarps, T>, threadsPerBlock, kBlocksPerCluster);
     unsigned totalBlocks = maxBlocks;
 
     printf("[FMM] Launching %u blocks (%u clusters of %u)\n",
@@ -970,26 +550,12 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
 
     checkGpuErrors(cudaMemset(d_nProd, 0, sizeof(unsigned)));
 
-    // 10. Allocate interaction counters for diagnostics
-    unsigned* d_m2lCount;
-    unsigned* d_p2pCount;
-    checkGpuErrors(cudaMalloc(&d_m2lCount, sizeof(unsigned)));
-    checkGpuErrors(cudaMalloc(&d_p2pCount, sizeof(unsigned)));
-    checkGpuErrors(cudaMemset(d_m2lCount, 0, sizeof(unsigned)));
-    checkGpuErrors(cudaMemset(d_p2pCount, 0, sizeof(unsigned)));
-
-    // 11. Launch dual traversal
-    checkGpuErrors(cudaLaunchKernelEx(&dualCfg, fmmDualTraversalKernel<numWarps, T>, d_childOffsets, d_geoCenters,
-                                      d_geoSizes, d_centers, d_multipoles, d_locals, d_internalToLeaf, d_layout, d_x,
-                                      d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz, firstTarget, invTheta, tables,
-                                      gq, tq, d_nProd, d_m2lCount, d_p2pCount));
+    // 10. Launch dual traversal
+    checkGpuErrors(cudaLaunchKernelEx(&dualCfg, fmmDualTraversalKernel<macType, numWarps, T>, d_childOffsets,
+                                      d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals, d_internalToLeaf,
+                                      d_layout, d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz, firstTarget,
+                                      tables, gq, tq, d_nProd));
     checkGpuErrors(cudaDeviceSynchronize());
-
-    // Print interaction counts for diagnostics
-    unsigned h_m2l, h_p2p;
-    checkGpuErrors(cudaMemcpy(&h_m2l, d_m2lCount, sizeof(unsigned), cudaMemcpyDeviceToHost));
-    checkGpuErrors(cudaMemcpy(&h_p2p, d_p2pCount, sizeof(unsigned), cudaMemcpyDeviceToHost));
-    printf("[FMM GPU] M2L calls: %u, P2P calls: %u\n", h_m2l, h_p2p);
 
     // 11. L2L downsweep
     downsweepLocalExpansionsGpu(levelRange, d_childOffsets, d_centers, d_locals, tables);
@@ -1068,9 +634,6 @@ void computeGravityFMMGpu(const KeyType* prefixes, const TreeNodeIndex* childOff
     cudaFree(d_twHead);
     cudaFree(d_trHead);
     cudaFree(d_tsegR);
-
-    cudaFree(d_m2lCount);
-    cudaFree(d_p2pCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,10 +655,26 @@ __global__ void sphApplyGScalingKernel(LocalIndex n, float G,
 }
 
 // ---------------------------------------------------------------------------
+// Helper kernel: scale Vec3 array by a scalar factor
+// ---------------------------------------------------------------------------
+
+template<class T>
+__global__ void sphScaleVec3Kernel(Vec3<T>* data, TreeNodeIndex n, T factor)
+{
+    TreeNodeIndex i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        data[i][0] *= factor;
+        data[i][1] *= factor;
+        data[i][2] *= factor;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GPU-native overload — takes device pointers, no CPU upload/download
 // ---------------------------------------------------------------------------
 
-template<class T, class KeyType>
+template<MacVariant macType = ScalarMac, class T, class KeyType>
 void computeGravityFMMGpu(
     const KeyType* d_prefixes, const TreeNodeIndex* d_childOffsets,
     const TreeNodeIndex* d_internalToLeaf, const TreeNodeIndex* d_leafToInternal,
@@ -1103,11 +682,10 @@ void computeGravityFMMGpu(
     std::span<const TreeNodeIndex> levelRange,
     TreeNodeIndex numNodes, TreeNodeIndex numLeaves,
     const T* d_x, const T* d_y, const T* d_z, const T* d_h, const T* d_m,
-    const cstone::Box<T>& box, float theta, float G,
+    const cstone::Box<T>& box, float G, float invTheta,
     T* d_ax, T* d_ay, T* d_az,
     T* ugravTot, LocalIndex numParticles)
 {
-    T          invTheta    = T(1) / T(theta);
     LocalIndex firstTarget = 0;
     LocalIndex numTargets  = numParticles;
 
@@ -1121,10 +699,18 @@ void computeGravityFMMGpu(
     checkGpuErrors(cudaMalloc(&d_geoSizes, numNodes * sizeof(Vec3<T>)));
     cstone::computeGeoCentersGpu(d_prefixes, numNodes, d_geoCenters, d_geoSizes, box);
 
+    // Scale geo sizes by invTheta for scalar MAC
+    if constexpr (macType == ScalarMac)
+    {
+        int nt = 256;
+        int nb = cstone::iceil(numNodes, nt);
+        if (nb) { sphScaleVec3Kernel<<<nb, nt>>>(d_geoSizes, numNodes, T(invTheta)); }
+    }
+
     // 3. Allocate device multipoles and compute P2M + M2M on GPU
-    GpuSphericalMultipole<T>* d_multipoles;
-    checkGpuErrors(cudaMalloc(&d_multipoles, numNodes * sizeof(GpuSphericalMultipole<T>)));
-    checkGpuErrors(cudaMemset(d_multipoles, 0, numNodes * sizeof(GpuSphericalMultipole<T>)));
+    SphericalMultipole<T>* d_multipoles;
+    checkGpuErrors(cudaMalloc(&d_multipoles, numNodes * sizeof(SphericalMultipole<T>)));
+    checkGpuErrors(cudaMemset(d_multipoles, 0, numNodes * sizeof(SphericalMultipole<T>)));
 
     computeLeafMultipolesGpu(d_x, d_y, d_z, d_m, d_leafToInternal, numLeaves, d_layout, d_centers, d_multipoles,
                              tables);
@@ -1132,9 +718,9 @@ void computeGravityFMMGpu(
     checkGpuErrors(cudaDeviceSynchronize());
 
     // 4. Allocate + zero-init device locals and particle accumulators
-    GpuSphericalLocalExpansion<T>* d_locals;
-    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(GpuSphericalLocalExpansion<T>)));
-    checkGpuErrors(cudaMemset(d_locals, 0, numNodes * sizeof(GpuSphericalLocalExpansion<T>)));
+    SphericalLocalExpansion<T>* d_locals;
+    checkGpuErrors(cudaMalloc(&d_locals, numNodes * sizeof(SphericalLocalExpansion<T>)));
+    checkGpuErrors(cudaMemset(d_locals, 0, numNodes * sizeof(SphericalLocalExpansion<T>)));
 
     T *d_ppot, *d_pax, *d_pay, *d_paz;
     checkGpuErrors(cudaMalloc(&d_ppot, numTargets * sizeof(T)));
@@ -1204,7 +790,7 @@ void computeGravityFMMGpu(
     constexpr unsigned threadsPerBlock   = FmmDualConfig::numThreadsPerBlock;
 
     unsigned maxBlocks = cstone::maxConcurrentBlocks(
-        fmmDualTraversalKernel<numWarps, T>, threadsPerBlock, kBlocksPerCluster);
+        fmmDualTraversalKernel<macType, numWarps, T>, threadsPerBlock, kBlocksPerCluster);
     unsigned totalBlocks = maxBlocks;
 
     cudaLaunchConfig_t    dualCfg{};
@@ -1220,26 +806,18 @@ void computeGravityFMMGpu(
 
     checkGpuErrors(cudaMemset(d_nProd, 0, sizeof(unsigned)));
 
-    // 8. Allocate interaction counters
-    unsigned* d_m2lCount;
-    unsigned* d_p2pCount;
-    checkGpuErrors(cudaMalloc(&d_m2lCount, sizeof(unsigned)));
-    checkGpuErrors(cudaMalloc(&d_p2pCount, sizeof(unsigned)));
-    checkGpuErrors(cudaMemset(d_m2lCount, 0, sizeof(unsigned)));
-    checkGpuErrors(cudaMemset(d_p2pCount, 0, sizeof(unsigned)));
-
-    // 9. Launch dual traversal
-    checkGpuErrors(cudaLaunchKernelEx(&dualCfg, fmmDualTraversalKernel<numWarps, T>, d_childOffsets, d_geoCenters,
-                                      d_geoSizes, d_centers, d_multipoles, d_locals, d_internalToLeaf, d_layout, d_x,
-                                      d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz, firstTarget, invTheta, tables,
-                                      gq, tq, d_nProd, d_m2lCount, d_p2pCount));
+    // 8. Launch dual traversal
+    checkGpuErrors(cudaLaunchKernelEx(&dualCfg, fmmDualTraversalKernel<macType, numWarps, T>, d_childOffsets,
+                                      d_geoCenters, d_geoSizes, d_centers, d_multipoles, d_locals, d_internalToLeaf,
+                                      d_layout, d_x, d_y, d_z, d_h, d_m, d_ppot, d_pax, d_pay, d_paz, firstTarget,
+                                      tables, gq, tq, d_nProd));
     checkGpuErrors(cudaDeviceSynchronize());
 
-    // 10. L2L downsweep
+    // 9. L2L downsweep
     downsweepLocalExpansionsGpu(levelRange, d_childOffsets, d_centers, d_locals, tables);
     checkGpuErrors(cudaDeviceSynchronize());
 
-    // 11. L2P
+    // 10. L2P
     {
         constexpr int numThreads = 256;
         if (numLeaves > 0)
@@ -1251,7 +829,7 @@ void computeGravityFMMGpu(
         }
     }
 
-    // 12. Apply G-scaling on GPU and accumulate into caller's output buffers
+    // 11. Apply G-scaling on GPU and accumulate into caller's output buffers
     {
         int nt = 256;
         int nb = cstone::iceil(numTargets, nt);
@@ -1262,7 +840,7 @@ void computeGravityFMMGpu(
         }
     }
 
-    // 13. Download potential sum for ugravTot (small scalar)
+    // 12. Download potential sum for ugravTot (small scalar)
     if (ugravTot)
     {
         std::vector<T> h_ppot(numTargets);
@@ -1277,7 +855,7 @@ void computeGravityFMMGpu(
 
     checkGpuErrors(cudaDeviceSynchronize());
 
-    // 14. Free internally-allocated temporaries (caller owns input device pointers)
+    // 13. Free internally-allocated temporaries (caller owns input device pointers)
     freeSphericalTables(tables);
 
     cudaFree(d_geoCenters);
@@ -1305,9 +883,6 @@ void computeGravityFMMGpu(
     cudaFree(d_twHead);
     cudaFree(d_trHead);
     cudaFree(d_tsegR);
-
-    cudaFree(d_m2lCount);
-    cudaFree(d_p2pCount);
 }
 
 } // namespace fmm

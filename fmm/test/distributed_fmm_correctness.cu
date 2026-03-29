@@ -14,8 +14,8 @@
  *
  * Uses Domain::syncGrav() for tree construction and MultipoleHolder::upsweep()
  * for distributed P2M + M2M + MPI exchange. The pre-computed multipoles are
- * fed to computeGravityFMMGpuDistributed() via reinterpret_cast (identical
- * layout: fmm::CartesianMultipole<T> == ryoanji::CartesianQuadrupole<T> == util::array<T, 8>).
+ * fed directly to computeGravityFMMGpuDistributed() since
+ * fmm::CartesianMultipole<T> is a type alias for ryoanji::CartesianQuadrupole<T>.
  */
 
 #include <mpi.h>
@@ -37,7 +37,13 @@ using namespace ryoanji;
 template<class T, class KeyType>
 static int multipoleHolderTest(int thisRank, int numRanks)
 {
-    using MultipoleType              = CartesianQuadrupole<T>;
+    using Tc            = T;
+    using Th            = T;
+    using Tm            = T;
+    using Ta            = T;
+    using Tf            = T;
+    using MultipoleType = CartesianQuadrupole<Tm>;
+
     const LocalIndex numParticles    = (100000 / numRanks) * numRanks;
     unsigned         bucketSize      = numParticles / (100 * numRanks);
     unsigned         bucketSizeLocal = std::min(64u, bucketSize);
@@ -52,26 +58,27 @@ static int multipoleHolderTest(int thisRank, int numRanks)
     cstone::RandomGaussianCoordinates<T, cstone::SfcKind<KeyType>> coords(numParticles, box);
     coords.adjustH(5, 10);
 
-    std::vector<T> globalMasses(numParticles, 1.0 / numParticles);
+    std::vector<Tm> globalMasses(numParticles, Tm(1.0) / numParticles);
 
     LocalIndex firstIndex = (numParticles * thisRank) / numRanks;
     LocalIndex lastIndex  = (numParticles * (thisRank + 1)) / numRanks;
 
     // extract a slice of the common pool
-    std::vector<T>       x(coords.x().begin() + firstIndex, coords.x().begin() + lastIndex);
-    std::vector<T>       y(coords.y().begin() + firstIndex, coords.y().begin() + lastIndex);
-    std::vector<T>       z(coords.z().begin() + firstIndex, coords.z().begin() + lastIndex);
-    std::vector<T>       h(coords.h().begin() + firstIndex, coords.h().begin() + lastIndex);
-    std::vector<T>       m(globalMasses.begin() + firstIndex, globalMasses.begin() + lastIndex);
+    std::vector<Tc>      x(coords.x().begin() + firstIndex, coords.x().begin() + lastIndex);
+    std::vector<Tc>      y(coords.y().begin() + firstIndex, coords.y().begin() + lastIndex);
+    std::vector<Tc>      z(coords.z().begin() + firstIndex, coords.z().begin() + lastIndex);
+    std::vector<Th>      h(coords.h().begin() + firstIndex, coords.h().begin() + lastIndex);
+    std::vector<Tm>      m(globalMasses.begin() + firstIndex, globalMasses.begin() + lastIndex);
     std::vector<KeyType> h_keys(x.size());
 
     cstone::Domain<KeyType, T, cstone::GpuTag> domain(thisRank, numRanks, bucketSize, bucketSizeLocal, theta, box);
 
-    MultipoleHolder<T, T, T, T, T, KeyType, MultipoleType> multipoleHolder;
+    MultipoleHolder<Tc, Th, Tm, Ta, Tf, KeyType, MultipoleType> multipoleHolder;
 
     cstone::DeviceVector<KeyType> d_keys = h_keys;
-    cstone::DeviceVector<T>       d_x = x, d_y = y, d_z = z, d_h = h;
-    cstone::DeviceVector<T>       d_m = m;
+    cstone::DeviceVector<Tc>      d_x = x, d_y = y, d_z = z;
+    cstone::DeviceVector<Th>      d_h = h;
+    cstone::DeviceVector<Tm>      d_m = m;
     cstone::DeviceVector<T>       s1;
     cstone::DeviceVector<T>       s2, s3;
     domain.syncGrav(d_keys, d_x, d_y, d_z, d_h, d_m, std::tuple{}, std::tie(s1, s2, s3));
@@ -95,17 +102,16 @@ static int multipoleHolderTest(int thisRank, int numRanks)
     multipoleHolder.upsweep(rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m), domain.globalTree(), domain.focusTree(),
                             domain.layout().data());
 
-    // reinterpret_cast: ryoanji::CartesianQuadrupole<T> == fmm::CartesianMultipole<T> == util::array<T, 8>
-    auto d_fmmMultipoles = reinterpret_cast<const fmm::CartesianMultipole<T>*>(multipoleHolder.deviceMultipoles());
+    const auto* d_fmmMultipoles = multipoleHolder.deviceMultipoles();
 
     // Extract tree data for FMM
     auto ltiSpan = octree.leafToInternalSpan();
     std::span<const cstone::SourceCenterType<T>> centers = focusTree.expansionCentersAcc();
 
     // FMM accelerations
-    cstone::DeviceVector<T> d_fmmAx(domain.nParticlesWithHalos(), 0);
-    cstone::DeviceVector<T> d_fmmAy(domain.nParticlesWithHalos(), 0);
-    cstone::DeviceVector<T> d_fmmAz(domain.nParticlesWithHalos(), 0);
+    cstone::DeviceVector<Ta> d_fmmAx(domain.nParticlesWithHalos(), 0);
+    cstone::DeviceVector<Ta> d_fmmAy(domain.nParticlesWithHalos(), 0);
+    cstone::DeviceVector<Ta> d_fmmAz(domain.nParticlesWithHalos(), 0);
 
     T                fmmPotential = 0;
     fmm::FmmGpuStats fmmStats;
@@ -125,6 +131,7 @@ static int multipoleHolderTest(int thisRank, int numRanks)
         rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_h), rawPtr(d_m),
         box, G, invTheta,
         rawPtr(d_fmmAx), rawPtr(d_fmmAy), rawPtr(d_fmmAz),
+        domain.startCell(), domain.endCell(),
         &fmmPotential, &fmmStats);
 
     // Download FMM accelerations for owned particles

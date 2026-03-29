@@ -38,7 +38,7 @@ if(CMAKE_CUDA_COMPILER OR CMAKE_HIP_COMPILER)
     target_compile_options(${tune_testname} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
     target_include_directories(${tune_testname} PRIVATE ${FMM_TEST_INCLUDE_DIRS})
     target_link_libraries(${tune_testname} PRIVATE
-        cstone_gpu cstone_thrust_incl
+        cstone_gpu cstone_thrust_incl ryoanji_kernels
         GTest::gtest_main OpenMP::OpenMP_CXX)
     if(CMAKE_CUDA_COMPILER)
         target_compile_options(${tune_testname} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)

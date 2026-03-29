@@ -28,11 +28,12 @@
 #include "cstone/traversal/traversal.hpp"
 #include "ryoanji/nbody/types.h"
 #include "ryoanji/nbody/kernel.hpp"
+#include "ryoanji/nbody/cartesian_qpole.hpp"
+
+#include "fmm_types.hpp"
 
 namespace fmm
 {
-
-enum MacVariant : int { ScalarMac = 0, DirectionalMac = 1 };
 
 using ryoanji::Vec3;
 using ryoanji::Vec4;
@@ -44,15 +45,9 @@ using ryoanji::Cqi;
 // Types
 // ---------------------------------------------------------------------------
 
-//! @brief Multipole type: {mass, qxx, qxy, qxz, qyy, qyz, qzz, trace}
-//! Same layout as ryoanji::CartesianQuadrupole, separate struct for ADL
+//! @brief Multipole type alias — use ryoanji::CartesianQuadrupole directly
 template<class T>
-struct CartesianMultipole : util::array<T, 8>
-{
-    using Base = util::array<T, 8>;
-    using Base::operator[];
-    using Base::operator=;
-};
+using CartesianMultipole = ryoanji::CartesianQuadrupole<T>;
 
 //! @brief Local expansion type: {pot, gx, gy, gz, txx, txy, txz, tyy, tyz, tzz}
 //! Stores Taylor coefficients: phi(x) ~ L0 + Li di + 1/2 Lij di dj
@@ -82,103 +77,12 @@ struct Cli
     };
 };
 
-// ---------------------------------------------------------------------------
-// P2M — Particle to Multipole
-// ---------------------------------------------------------------------------
-
-template<int stride, class T1, class T2, class T3>
-HOST_DEVICE_FUN void P2M_add(const T1* x, const T1* y, const T1* z, const T2* m, LocalIndex begin, LocalIndex end,
-             const Vec4<T1>& center, CartesianMultipole<T3>& gv)
-{
-    for (LocalIndex i = begin; i < end; i += stride)
-    {
-        T1 xx  = x[i];
-        T1 yy  = y[i];
-        T1 zz  = z[i];
-        T1 m_i = m[i];
-
-        T1 rx = xx - center[0];
-        T1 ry = yy - center[1];
-        T1 rz = zz - center[2];
-
-        gv[Cqi::mass] += m_i;
-        gv[Cqi::qxx] += rx * rx * m_i;
-        gv[Cqi::qxy] += rx * ry * m_i;
-        gv[Cqi::qxz] += rx * rz * m_i;
-        gv[Cqi::qyy] += ry * ry * m_i;
-        gv[Cqi::qyz] += ry * rz * m_i;
-        gv[Cqi::qzz] += rz * rz * m_i;
-    }
-}
-
-template<class T>
-HOST_DEVICE_FUN CartesianMultipole<T> P2M_finalize(CartesianMultipole<T> gv)
-{
-    T traceQ = gv[Cqi::qxx] + gv[Cqi::qyy] + gv[Cqi::qzz];
-
-    gv[Cqi::trace] = traceQ;
-
-    gv[Cqi::qxx] = 3 * gv[Cqi::qxx] - traceQ;
-    gv[Cqi::qyy] = 3 * gv[Cqi::qyy] - traceQ;
-    gv[Cqi::qzz] = 3 * gv[Cqi::qzz] - traceQ;
-    gv[Cqi::qxy] *= 3;
-    gv[Cqi::qxz] *= 3;
-    gv[Cqi::qyz] *= 3;
-
-    return gv;
-}
-
-template<int stride = 1, class T1, class T2, class T3>
-HOST_DEVICE_FUN void P2M(const T1* x, const T1* y, const T1* z, const T2* m, LocalIndex begin, LocalIndex end,
-         const Vec4<T1>& center, CartesianMultipole<T3>& gv)
-{
-    gv = T3(0);
-    P2M_add<stride>(x, y, z, m, begin, end, center, gv);
-    gv = P2M_finalize(gv);
-}
-
-// ---------------------------------------------------------------------------
-// M2M — Multipole to Multipole (parallel axis theorem)
-// ---------------------------------------------------------------------------
-
-template<class T, class Tc>
-HOST_DEVICE_FUN void addQuadrupole(CartesianMultipole<T>& composite, Vec3<Tc> dX, const CartesianMultipole<T>& addend)
-{
-    Tc rx = dX[0];
-    Tc ry = dX[1];
-    Tc rz = dX[2];
-
-    Tc rx_2 = rx * rx;
-    Tc ry_2 = ry * ry;
-    Tc rz_2 = rz * rz;
-    Tc r_2  = (rx_2 + ry_2 + rz_2) * Tc(1.0 / 3.0);
-
-    Tc ml = addend[Cqi::mass] * 3;
-
-    composite[Cqi::trace] = composite[Cqi::trace] + addend[Cqi::trace] + ml * r_2;
-
-    composite[Cqi::mass] += addend[Cqi::mass];
-    composite[Cqi::qxx] += addend[Cqi::qxx] + ml * (rx_2 - r_2);
-    composite[Cqi::qxy] += addend[Cqi::qxy] + ml * rx * ry;
-    composite[Cqi::qxz] += addend[Cqi::qxz] + ml * rx * rz;
-    composite[Cqi::qyy] += addend[Cqi::qyy] + ml * (ry_2 - r_2);
-    composite[Cqi::qyz] += addend[Cqi::qyz] + ml * ry * rz;
-    composite[Cqi::qzz] += addend[Cqi::qzz] + ml * (rz_2 - r_2);
-}
-
-template<class T, class Tm>
-HOST_DEVICE_FUN void M2M(int begin, int end, const Vec4<T>& Xout, const Vec4<T>* Xsrc,
-         const CartesianMultipole<Tm>* Msrc, CartesianMultipole<Tm>& Mout)
-{
-    Mout = 0;
-    for (int i = begin; i < end; i++)
-    {
-        const CartesianMultipole<Tm>& Mi = Msrc[i];
-        Vec4<T>                       Xi = Xsrc[i];
-        Vec3<T>                       dX = util::makeVec3(Xout - Xi);
-        addQuadrupole(Mout, dX, Mi);
-    }
-}
+// P2M, P2M_add, P2M_finalize, addQuadrupole, M2M — use ryoanji implementations directly
+using ryoanji::P2M;
+using ryoanji::P2M_add;
+using ryoanji::P2M_finalize;
+using ryoanji::addQuadrupole;
+using ryoanji::M2M;
 
 // ---------------------------------------------------------------------------
 // M2L — Multipole to Local (core FMM kernel)

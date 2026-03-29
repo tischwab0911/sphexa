@@ -15,23 +15,25 @@
  * Runs the production computeGravityFMMGpu path with a single configuration
  * for use with nsys/ncu profiling. Separated from tune_cartesian_fmm.cu to
  * avoid pulling in the full tuning sweep infrastructure.
+ *
+ * Uses GPU octree build (TreeBuilder) to keep all data on device.
  */
 
-#include <vector>
-#include <numeric>
 #include <cstdio>
+
+#include <thrust/device_vector.h>
 
 #include "gtest/gtest.h"
 
+#include "cstone/cuda/cuda_utils.cuh"
+#include "cstone/cuda/thrust_util.cuh"
+#include "cstone/focus/source_center_gpu.h"
 #include "cstone/sfc/box.hpp"
 #include "cstone/tree/octree.hpp"
-#include "cstone/tree/cs_util.hpp"
 #include "coord_samples/random.hpp"
 
-#include "ryoanji/nbody/cartesian_qpole.hpp"
-#include "ryoanji/nbody/upsweep_cpu.hpp"
+#include "ryoanji/interface/treebuilder.cuh"
 
-#include "fmm/cartesian_qpole_fmm.hpp"
 #include "fmm/cartesian_qpole_fmm.cuh"
 
 using namespace cstone;
@@ -40,7 +42,6 @@ TEST(CartesianFMM, ProfileDualTraversal)
 {
     using T       = double;
     using KeyType = uint64_t;
-    using Mpole   = fmm::CartesianMultipole<T>;
 
     unsigned            N          = 100000000;
     float               theta      = 0.5f;
@@ -48,51 +49,56 @@ TEST(CartesianFMM, ProfileDualTraversal)
     unsigned            bucketSize = 64;
     cstone::Box<double> box(-1, 1);
 
-    // Build octree + multipoles
+    // Generate particles on CPU (SFC-sorted)
     RandomGaussianCoordinates<T, SfcKind<KeyType>> coordinates(N, box);
     coordinates.adjustH(2, 5);
 
-    const T* x = coordinates.x().data();
-    const T* y = coordinates.y().data();
-    const T* z = coordinates.z().data();
-    const T* h = coordinates.h().data();
+    // Upload to GPU
+    thrust::device_vector<T> d_x(coordinates.x().begin(), coordinates.x().end());
+    thrust::device_vector<T> d_y(coordinates.y().begin(), coordinates.y().end());
+    thrust::device_vector<T> d_z(coordinates.z().begin(), coordinates.z().end());
+    thrust::device_vector<T> d_m(N, T(1) / N);
+    thrust::device_vector<T> d_h(coordinates.h().begin(), coordinates.h().end());
 
-    std::vector<T> masses(N, T(1) / N);
+    // GPU octree build
+    ryoanji::TreeBuilder<KeyType> treeBuilder(bucketSize);
+    int numSources = treeBuilder.update(rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), N, box);
+    // x,y,z now SFC-sorted on device; h,m stay aligned (input was already SFC-sorted)
 
-    auto [treeLeaves, counts] = computeOctree(std::span(coordinates.particleKeys()), bucketSize);
+    unsigned              highestLevel = treeBuilder.maxTreeLevel();
+    const TreeNodeIndex*  levelRange   = treeBuilder.levelRange();
+    TreeNodeIndex         numLeaves    = treeBuilder.numLeafNodes();
+    std::span<const TreeNodeIndex> levelRangeSpan(levelRange, highestLevel + 2);
 
-    OctreeData<KeyType, CpuTag> octree;
-    octree.resize(nNodes(treeLeaves));
-    updateInternalTree<KeyType>(treeLeaves, octree.data());
-
-    std::vector<LocalIndex> layout(octree.numLeafNodes + 1, 0);
-    std::inclusive_scan(counts.begin(), counts.end(), layout.begin() + 1);
-
-    auto toInternal = leafToInternal(octree);
-
-    std::vector<SourceCenterType<T>> centers(octree.numNodes);
-    computeLeafMassCenter<T, T, T>(coordinates.x(), coordinates.y(), coordinates.z(), masses, toInternal, layout.data(),
-                                   centers.data());
-    upsweep(octree.levelRange, octree.childOffsets.data(), centers.data(), CombineSourceCenter<T>{});
-    setMac<T, KeyType>(octree.prefixes, centers, 1.0 / theta, box);
-
-    std::vector<Mpole> multipoles(octree.numNodes);
-    ryoanji::computeLeafMultipoles(x, y, z, masses.data(), toInternal, layout.data(), centers.data(),
-                                   multipoles.data());
-    ryoanji::upsweepMultipoles(octree.levelRange, octree.childOffsets.data(), centers.data(), multipoles.data());
+    // GPU source centers + MAC
+    thrust::device_vector<SourceCenterType<T>> d_centers(numSources);
+    cstone::computeLeafSourceCenterGpu(rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_m),
+                                       treeBuilder.leafToInternal(), numLeaves,
+                                       treeBuilder.layout(), rawPtr(d_centers));
+    cstone::upsweepCentersGpu(highestLevel, levelRange,
+                              treeBuilder.childOffsets(), rawPtr(d_centers));
+    cstone::setMacGpu(treeBuilder.nodeKeys(), TreeNodeIndex(numSources), rawPtr(d_centers), 1.0f / theta, box);
 
     float invTheta = 1.0f / theta;
 
+    // Acceleration output buffers
+    thrust::device_vector<T> d_ax(N), d_ay(N), d_az(N);
+
     auto runOnce = [&](fmm::FmmGpuStats* stats) -> T
     {
-        std::vector<T> ax(N, 0), ay(N, 0), az(N, 0);
-        T              egrav = 0;
+        checkGpuErrors(cudaMemset(rawPtr(d_ax), 0, N * sizeof(T)));
+        checkGpuErrors(cudaMemset(rawPtr(d_ay), 0, N * sizeof(T)));
+        checkGpuErrors(cudaMemset(rawPtr(d_az), 0, N * sizeof(T)));
+        T egrav = 0;
 
         fmm::computeGravityFMMGpu<fmm::DirectionalMac>(
-            octree.prefixes.data(), octree.childOffsets.data(), octree.internalToLeaf.data(), toInternal,
-            std::span<const TreeNodeIndex>(octree.levelRange), centers.data(), multipoles.data(), layout.data(), 0,
-            octree.numLeafNodes, x, y, z, h, masses.data(), box, G, invTheta, (T*)nullptr, ax.data(), ay.data(),
-            az.data(), &egrav, N, stats);
+            treeBuilder.nodeKeys(), treeBuilder.childOffsets(),
+            treeBuilder.internalToLeaf(), treeBuilder.leafToInternal(),
+            treeBuilder.layout(), rawPtr(d_centers),
+            levelRangeSpan, TreeNodeIndex(numSources), numLeaves,
+            rawPtr(d_x), rawPtr(d_y), rawPtr(d_z), rawPtr(d_h), rawPtr(d_m),
+            box, G, invTheta, rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
+            &egrav, N, stats);
 
         return egrav;
     };
